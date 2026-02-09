@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()  # Load .env file if present
 
 # --- Chrome / Selenium ---
-CHROME_HEADLESS = False
+CHROME_HEADLESS = True
 CHROME_WINDOW_SIZE = "1920,1080"
 CHROME_PAGE_LOAD_TIMEOUT = 30  # Increased for slow pages (e.g. Instagram)
 CHROME_IMPLICIT_WAIT = 5
