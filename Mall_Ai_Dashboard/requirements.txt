@@ -1,0 +1,14 @@
+streamlit
+pandas
+requests
+selenium
+webdriver-manager
+beautifulsoup4
+lxml
+openpyxl
+python-dotenv
+selenium>=4.8
+webdriver-manager>=4.0.0
+python-dotenv>=1.0.0
+requests>=2.28
+selenium-wire>=5.1.0
