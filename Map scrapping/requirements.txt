@@ -6,7 +6,9 @@ opencv-python
 numpy
 requests
 Pillow
+rapidfuzz
 selenium
 selenium-wire
+undetected-chromedriver
 webdriver-manager
 blinker==1.7.0

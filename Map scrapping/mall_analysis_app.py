@@ -24,8 +24,8 @@ import gc
 
 # Configuration
 JSON_DATA_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "tenants_detailed.json")
-# We'll use a session-specific directory for uploads if they aren't using the default path
-IMAGES_DIR = "C:/Users/srira/Downloads/test_img"
+# Use current user's Downloads so it works on any machine (no hardcoded usernames)
+IMAGES_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "mall_analysis_reports")
 
 if not os.path.exists(IMAGES_DIR):
     os.makedirs(IMAGES_DIR, exist_ok=True)
