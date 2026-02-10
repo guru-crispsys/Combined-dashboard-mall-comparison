@@ -158,7 +158,7 @@ INSTRUCTIONS:
    - headings or inline text
 7. Look for patterns like: "Store Name", "Shop Name", retailer names, brand names, business names.
 8. Skip navigation/UI text like: Home, About, Contact, Search, Sign In, Menu, Cart, See More, Learn More, Shop, Store, Terms, Privacy, Cookie, Careers, Leasing, Company, Corporate.
-9. Remove duplicates (same shop name should appear only once, even if it appears in multiple places or both in text and in a "Current Tenants" table).
+9. If the SAME shop name appears multiple times as separate entries (for example, multiple cards or units for "Banter by Piercing Pagoda"), you MUST output ONE LINE PER OCCURRENCE. Do NOT merge or de-duplicate shops with the same name.
 
 OUTPUT FORMAT (PLAIN TEXT ONLY):
 - Return ONLY plain text (no JSON, no markdown, no code blocks).
