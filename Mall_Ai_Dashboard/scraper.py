@@ -53,6 +53,38 @@ def create_driver():
     return driver
 
 
+def _extract_shop_names_from_attributes(soup):
+    """
+    Extract shop/store names from img alt, aria-label, and title attributes.
+    Mall directories often render shop names as logos (images) or in these
+    attributes, which soup.get_text() does not capture.
+    Returns a list of unique strings to append to the text sent to the LLM.
+    """
+    seen = set()
+    collected = []
+    skip_prefixes = ("http", "www.", "data:", "javascript:", "button", "link", "close", "menu", "search")
+    skip_words = ("logo", "icon", "image", "photo", "thumbnail", "placeholder")
+
+    for elem in soup.find_all(True):
+        for attr in ("alt", "aria-label", "title", "data-store-name", "data-name", "data-title"):
+            val = elem.get(attr)
+            if not val or not isinstance(val, str):
+                continue
+            val = val.strip()
+            if len(val) < 3 or len(val) > 80:
+                continue
+            if val.lower().startswith(skip_prefixes):
+                continue
+            if any(w in val.lower() for w in skip_words) and len(val) < 15:
+                continue
+            key = val.lower()
+            if key not in seen:
+                seen.add(key)
+                collected.append(val)
+
+    return collected
+
+
 def extract_category_links_from_soup(soup, base_url=""):
     """Extract category links from action-card elements.
     
@@ -1280,6 +1312,11 @@ def scrape_url(url, output_csv: str = DEFAULT_OUTPUT_CSV, output_text: str = DEF
             # Extract text with sensible newlines, but keep all lines;
             # let the LLM decide what is noise vs. useful content.
             clean_text = soup.get_text(separator="\n", strip=True)
+            # Also extract shop names from img alt, aria-label, title, etc.
+            # (many mall directories render shop names as logos or in attributes)
+            attr_names = _extract_shop_names_from_attributes(soup)
+            if attr_names:
+                clean_text += "\n\nStore names from page (alt/aria-label/title):\n" + "\n".join(attr_names)
             # Normalize excessive whitespace but keep even short lines,
             # because some shop names or codes can be short.
             lines = [line.strip() for line in clean_text.split("\n")]
