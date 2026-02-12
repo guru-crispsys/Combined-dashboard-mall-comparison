@@ -104,6 +104,16 @@ def _is_mall_name_or_section_header(name: str) -> bool:
     name_original = name.strip()
     name_lower = name_original.lower()
     
+    # Skip if name contains source indicators like "Website Data", "Facebook Data", "Instagram Data"
+    source_indicators = ['website data', 'facebook data', 'instagram data', 'web data', 'fb data', 'ig data']
+    if any(indicator in name_lower for indicator in source_indicators):
+        return True
+    
+    # Skip if name has multiple consecutive commas (likely metadata, not shop name)
+    # Pattern like "OakViewMall,,,Website Data" or "Name,,,something"
+    if ',,' in name_original or name_original.count(',') >= 2:
+        return True
+    
     # Skip if name ends with colon (section headers like "Bellevue Square:", "Lincoln Square:")
     if name_original.endswith(':'):
         return True
@@ -158,10 +168,141 @@ def _is_mall_name_or_section_header(name: str) -> bool:
     return False
 
 
+def _is_domain_or_url(name: str) -> bool:
+    """Check if name is a domain/URL (like vicspopcornomaha.com, www.example.com).
+    
+    This function is conservative - it only filters out CLEAR domains/URLs, not shop names
+    that might contain .com as part of their branding (like "Shop.com" store).
+    """
+    if not name:
+        return False
+    
+    name_lower = name.lower().strip()
+    name_original = name.strip()
+    
+    # Skip if it starts with http:// or https:// (clear URL)
+    if name_lower.startswith(('http://', 'https://')):
+        return True
+    
+    # Skip if it starts with www. (clear domain)
+    if name_lower.startswith('www.'):
+        return True
+    
+    # Only filter domains that are clearly NOT shop names:
+    # 1. Must contain a dot (for TLD)
+    # 2. Must NOT contain spaces (domains don't have spaces)
+    # 3. Must be all lowercase (shop names with .com branding usually have capitals)
+    # 4. Must end with a TLD pattern
+    if '.' in name_lower and ' ' not in name_lower:
+        # Check if it ends with a TLD
+        tld_pattern = r'\.[a-z]{2,}$'
+        if re.search(tld_pattern, name_lower):
+            # Only filter if it's all lowercase (domains are lowercase)
+            # Shop names with .com branding usually have capitals (e.g., "Shop.com", "Store.com")
+            if name_original == name_lower:
+                # All lowercase with TLD = likely a domain
+                # But check if it's very short (might be a shop name like "a.com")
+                if len(name_lower) > 8:  # Domains are usually longer
+                    return True
+                # Very short names might be shop names, so be conservative
+                return False
+            # Has capitals = likely a shop name with .com branding, keep it
+            return False
+    
+    return False
+
+
+def _normalize_for_dedup(name: str) -> str:
+    """Normalize shop name for fuzzy deduplication (remove common words, normalize spacing)."""
+    if not name:
+        return ""
+    
+    # Convert to lowercase
+    normalized = name.lower().strip()
+    
+    # Remove common words that don't help with matching
+    common_words = ["the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "with", "by"]
+    words = normalized.split()
+    words = [w for w in words if w not in common_words]
+    
+    # Remove punctuation and special characters for comparison
+    normalized = re.sub(r'[^\w\s]', '', ' '.join(words))
+    
+    # Remove extra spaces
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    
+    return normalized
+
+
+def _are_similar_shops(name1: str, name2: str) -> bool:
+    """Check if two shop names are similar (fuzzy matching for deduplication)."""
+    if not name1 or not name2:
+        return False
+    
+    # Normalize both names
+    norm1 = _normalize_for_dedup(name1)
+    norm2 = _normalize_for_dedup(name2)
+    
+    if not norm1 or not norm2:
+        return False
+    
+    # Exact match after normalization
+    if norm1 == norm2:
+        return True
+    
+    # Extract key words (remove common words)
+    words1 = set(norm1.split())
+    words2 = set(norm2.split())
+    
+    if not words1 or not words2:
+        return False
+    
+    # Check if they share significant words
+    common_words = words1.intersection(words2)
+    
+    # If they share at least 2 words, they might be the same shop
+    if len(common_words) >= 2:
+        return True
+    
+    # Check for word similarity (like "popcorn" vs "popper", "corn" vs "popcorn")
+    unique1 = words1 - words2
+    unique2 = words2 - words1
+    
+    # Check if unique words are similar (same root, contains, or similar meaning)
+    for u1 in unique1:
+        for u2 in unique2:
+            # Check if words are similar (one contains the other or shares root)
+            if u1 in u2 or u2 in u1:
+                # If they share at least one common word, consider them similar
+                if len(common_words) >= 1:
+                    return True
+            # Check if words share a common root (first 4+ characters)
+            if len(u1) > 4 and len(u2) > 4:
+                if u1[:4] == u2[:4] or u1[:5] == u2[:5]:
+                    if len(common_words) >= 1:
+                        return True
+    
+    # Special case: if one name contains all words from the other (with variations)
+    # Example: "vics popcorn" vs "corn vics popper" - "vics" is common, "popcorn" vs "popper" are similar
+    if len(common_words) >= 1:
+        # Check if remaining words are similar
+        for u1 in unique1:
+            for u2 in unique2:
+                # Check for similar words (popcorn/popper, corn/popcorn)
+                if (u1.startswith(u2[:3]) or u2.startswith(u1[:3])) and len(u1) > 3 and len(u2) > 3:
+                    return True
+    
+    return False
+
+
 def _is_valid_shop(name: str, phone: str) -> bool:
     """Check if entry looks like a valid shop/kiosk."""
     # Must have a name
     if not name or len(name) < 2:
+        return False
+    
+    # Skip if it's a domain/URL
+    if _is_domain_or_url(name):
         return False
     
     # Skip if it's an address
@@ -209,6 +350,7 @@ def clean_raw_file(input_file, output_file):
         shops.append(current_shop)
 
     seen = set()
+    seen_names = []  # Keep list of normalized names for fuzzy matching
     cleaned_rows = []
 
     for shop in shops:
@@ -254,13 +396,26 @@ def clean_raw_file(input_file, output_file):
         if not _is_valid_shop(name, phone):
             continue
 
-        # Deduplicate by combination of name, phone, and floor (all must match to be duplicate)
-        # This allows multiple shops with same name but different phone/floor
+        # Deduplicate: first check exact match, then fuzzy match for similar shop names
         unique_key = (name.lower(), phone.lower() if phone else "", floor.lower() if floor else "")
         if unique_key in seen:
             continue
+        
+        # Check for fuzzy matches with existing shops (same phone or no phone)
+        is_duplicate = False
+        normalized_name = _normalize_for_dedup(name)
+        for existing_name, existing_phone, existing_floor in seen_names:
+            # Only fuzzy match if phones match (or both have no phone)
+            phones_match = (phone == existing_phone) or (not phone and not existing_phone) or (phone == "-" and existing_phone == "-")
+            if phones_match and _are_similar_shops(name, existing_name):
+                is_duplicate = True
+                break
+        
+        if is_duplicate:
+            continue
+        
         seen.add(unique_key)
-
+        seen_names.append((name, phone, floor))
         cleaned_rows.append((name, phone, floor))
 
     # Write cleaned CSV
@@ -294,6 +449,7 @@ def clean_raw_text(text: str):
 
     rows = []
     seen = set()
+    seen_names = []  # Keep list of normalized names for fuzzy matching
     for shop in shops:
         raw_name = shop.get("shop_name", "")
         raw_phone = shop.get("phone", "")
@@ -328,12 +484,26 @@ def clean_raw_text(text: str):
         if not _is_valid_shop(name, phone):
             continue
 
-        # Deduplicate by combination of name, phone, and floor (all must match to be duplicate)
-        # This allows multiple shops with same name but different phone/floor
+        # Deduplicate: first check exact match, then fuzzy match for similar shop names
         unique_key = (name.lower(), phone.lower() if phone else "", floor.lower() if floor else "")
         if unique_key in seen:
             continue
+        
+        # Check for fuzzy matches with existing shops (same phone or no phone)
+        is_duplicate = False
+        normalized_name = _normalize_for_dedup(name)
+        for existing_name, existing_phone, existing_floor in seen_names:
+            # Only fuzzy match if phones match (or both have no phone)
+            phones_match = (phone == existing_phone) or (not phone and not existing_phone) or (phone == "-" and existing_phone == "-")
+            if phones_match and _are_similar_shops(name, existing_name):
+                is_duplicate = True
+                break
+        
+        if is_duplicate:
+            continue
+        
         seen.add(unique_key)
+        seen_names.append((name, phone, floor))
         rows.append({"shop_name": name, "phone": phone, "floor": floor})
 
     df = pd.DataFrame(rows, columns=["shop_name", "phone", "floor"]).astype(str)

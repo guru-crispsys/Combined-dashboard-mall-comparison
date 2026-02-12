@@ -13,37 +13,90 @@ from instagram import scrape_instagram_simple
 from excel_exporter import create_mall_excel_export
 
 def _load_shared_urls() -> str:
-    """Pre-fill only when opened from main UI with matching one-time token; otherwise return empty so refresh doesn't show old data."""
+    """Pre-fill when opened from main UI (has app param); clear token after use to prevent refresh pre-fill."""
     APP_KEY = "mall_dashboard"
     root = Path(__file__).resolve().parent.parent
     shared = root / "shared_dashboard_input.json"
     token_file = root / "shared_dashboard_delivery_token.json"
+    
+    # Check if shared data exists
+    if not shared.exists():
+        return ""
+    
     try:
-        params = getattr(st, "query_params", None) or st.experimental_get_query_params()
-        param_token = params.get("from_dashboard")
-        param_app = params.get("app")
-        if isinstance(param_token, list):
-            param_token = param_token[0] if param_token else None
-        if isinstance(param_app, list):
-            param_app = param_app[0] if param_app else None
-        if not param_token or param_app != APP_KEY or not token_file.exists():
-            return ""
-        tokens = json.loads(token_file.read_text(encoding="utf-8"))
-        if tokens.get(APP_KEY) != param_token:
-            return ""
-        data = json.loads(shared.read_text(encoding="utf-8")) if shared.exists() else {}
+        data = json.loads(shared.read_text(encoding="utf-8"))
         parts = []
         for key in ("official_website", "mall_facebook_link", "mall_instagram_link"):
             v = (data.get(key) or "").strip()
             if v:
                 parts.append(v)
-        result = "\n".join(parts) if parts else ""
+        
+        if not parts:
+            return ""
+        
+        result = "\n".join(parts)
+        
+        # Check if we're coming from main UI (has app param)
         try:
-            tokens[APP_KEY] = ""
-            token_file.write_text(json.dumps(tokens), encoding="utf-8")
+            try:
+                params = st.query_params
+            except AttributeError:
+                params = st.experimental_get_query_params()
+            
+            param_app = params.get("app")
+            if isinstance(param_app, list):
+                param_app = param_app[0] if param_app else None
+            
+            # If app param matches, we're coming from main UI - pre-fill and clear token
+            if param_app == APP_KEY:
+                param_token = params.get("from_dashboard")
+                if isinstance(param_token, list):
+                    param_token = param_token[0] if param_token else None
+                
+                # Try to validate and clear token (but pre-fill regardless)
+                if token_file.exists() and param_token:
+                    try:
+                        tokens = json.loads(token_file.read_text(encoding="utf-8"))
+                        if tokens.get(APP_KEY) == param_token:
+                            # Token matches - clear it so refresh won't pre-fill again
+                            tokens[APP_KEY] = ""
+                            token_file.write_text(json.dumps(tokens), encoding="utf-8")
+                        else:
+                            # Token doesn't match - might be refresh, but still pre-fill on first load
+                            # Create cleared token so next refresh won't pre-fill
+                            tokens[APP_KEY] = ""
+                            token_file.write_text(json.dumps(tokens), encoding="utf-8")
+                    except Exception:
+                        # If token file read fails, create cleared token anyway
+                        try:
+                            tokens = {APP_KEY: ""}
+                            token_file.write_text(json.dumps(tokens), encoding="utf-8")
+                        except Exception:
+                            pass
+                else:
+                    # No token file or no token param - create cleared token so refresh won't pre-fill
+                    try:
+                        tokens = {APP_KEY: ""}
+                        token_file.write_text(json.dumps(tokens), encoding="utf-8")
+                    except Exception:
+                        pass
+                
+                return result
+            else:
+                # No app param or doesn't match - check if token was already cleared (refresh scenario)
+                if token_file.exists():
+                    try:
+                        tokens = json.loads(token_file.read_text(encoding="utf-8"))
+                        if tokens.get(APP_KEY) == "":
+                            # Token was cleared - this is a refresh, don't pre-fill
+                            return ""
+                    except Exception:
+                        pass
+                # No app param but token not cleared - might be direct access, don't pre-fill
+                return ""
         except Exception:
-            pass
-        return result
+            # If query param reading fails, don't pre-fill (safety)
+            return ""
     except Exception:
         return ""
 
@@ -212,9 +265,34 @@ with col_links:
 
 # Single or multiple URL scrape (supports both website and Facebook URLs)
 if scrape_use_btn:
+    # Fallback: if input_url is empty but we're coming from main UI, try to read shared data directly
+    if not input_url or not input_url.strip():
+        try:
+            try:
+                params = st.query_params
+            except AttributeError:
+                params = st.experimental_get_query_params()
+            param_app = params.get("app")
+            if isinstance(param_app, list):
+                param_app = param_app[0] if param_app else None
+            if param_app == "mall_dashboard":
+                root = Path(__file__).resolve().parent.parent
+                shared = root / "shared_dashboard_input.json"
+                if shared.exists():
+                    data = json.loads(shared.read_text(encoding="utf-8"))
+                    parts = []
+                    for key in ("official_website", "mall_facebook_link", "mall_instagram_link"):
+                        v = (data.get(key) or "").strip()
+                        if v:
+                            parts.append(v)
+                    if parts:
+                        input_url = "\n".join(parts)
+        except Exception:
+            pass
+    
     with st.spinner("Scraping site(s) and preparing NEW data (this may take several minutes)..."):
         try:
-            if not input_url:
+            if not input_url or not input_url.strip():
                 st.error("Please provide at least one mall site URL or Facebook page URL in the input box before scraping.")
                 new_df = None
             else:

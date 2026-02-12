@@ -158,7 +158,12 @@ INSTRUCTIONS:
    - headings or inline text
 7. Look for patterns like: "Store Name", "Shop Name", retailer names, brand names, business names.
 8. Skip navigation/UI text like: Home, About, Contact, Search, Sign In, Menu, Cart, See More, Learn More, Shop, Store, Terms, Privacy, Cookie, Careers, Leasing, Company, Corporate.
-9. If the SAME shop name appears multiple times as separate entries (for example, multiple cards or units for "Banter by Piercing Pagoda"), you MUST output ONE LINE PER OCCURRENCE. Do NOT merge or de-duplicate shops with the same name.
+9. CRITICAL: Do NOT extract CLEAR website domains or URLs as shop names. Skip entries like:
+   - "vicspopcornomaha.com" (all lowercase, no spaces, ends with TLD)
+   - "www.example.com" (starts with www.)
+   - "http://example.com" or "https://example.com" (starts with http)
+   However, DO extract shop names that contain .com as part of their branding (like "Shop.com" store, "Store.com" - these usually have capital letters and are actual shop names).
+10. If the SAME shop name appears multiple times as separate entries (for example, multiple cards or units for "Banter by Piercing Pagoda"), you MUST output ONE LINE PER OCCURRENCE. Do NOT merge or de-duplicate shops with the same name.
 
 OUTPUT FORMAT (PLAIN TEXT ONLY):
 - Return ONLY plain text (no JSON, no markdown, no code blocks).

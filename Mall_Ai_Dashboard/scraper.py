@@ -60,10 +60,53 @@ def _extract_shop_names_from_attributes(soup):
     attributes, which soup.get_text() does not capture.
     Returns a list of unique strings to append to the text sent to the LLM.
     """
+    import re
     seen = set()
     collected = []
     skip_prefixes = ("http", "www.", "data:", "javascript:", "button", "link", "close", "menu", "search")
     skip_words = ("logo", "icon", "image", "photo", "thumbnail", "placeholder")
+
+    def _is_domain(val: str) -> bool:
+        """Check if value looks like a domain/URL.
+        
+        Conservative filtering - only filters CLEAR domains, not shop names with .com branding.
+        """
+        if not val:
+            return False
+        
+        val_lower = val.lower().strip()
+        val_original = val.strip()
+        
+        # Skip if it starts with http:// or https:// (clear URL)
+        if val_lower.startswith(('http://', 'https://')):
+            return True
+        
+        # Skip if it starts with www. (clear domain)
+        if val_lower.startswith('www.'):
+            return True
+        
+        # Only filter domains that are clearly NOT shop names:
+        # 1. Must contain a dot (for TLD)
+        # 2. Must NOT contain spaces (domains don't have spaces)
+        # 3. Must be all lowercase (shop names with .com branding usually have capitals)
+        # 4. Must end with a TLD pattern
+        if '.' in val_lower and ' ' not in val_lower:
+            # Check if it ends with a TLD
+            tld_pattern = r'\.[a-z]{2,}$'
+            if re.search(tld_pattern, val_lower):
+                # Only filter if it's all lowercase (domains are lowercase)
+                # Shop names with .com branding usually have capitals (e.g., "Shop.com", "Store.com")
+                if val_original == val_lower:
+                    # All lowercase with TLD = likely a domain
+                    # But check if it's very short (might be a shop name like "a.com")
+                    if len(val_lower) > 8:  # Domains are usually longer
+                        return True
+                    # Very short names might be shop names, so be conservative
+                    return False
+                # Has capitals = likely a shop name with .com branding, keep it
+                return False
+        
+        return False
 
     for elem in soup.find_all(True):
         for attr in ("alt", "aria-label", "title", "data-store-name", "data-name", "data-title"):
@@ -76,6 +119,9 @@ def _extract_shop_names_from_attributes(soup):
             if val.lower().startswith(skip_prefixes):
                 continue
             if any(w in val.lower() for w in skip_words) and len(val) < 15:
+                continue
+            # Skip domains/URLs
+            if _is_domain(val):
                 continue
             key = val.lower()
             if key not in seen:
