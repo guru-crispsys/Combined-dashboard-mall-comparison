@@ -3,8 +3,9 @@
 .env.*
 !.env.example
 
-# Main UI shared input (user data, do not commit)
+# Main UI shared input and delivery tokens (user data / runtime, do not commit)
 shared_dashboard_input.json
+shared_dashboard_delivery_token.json
 
 # Python
 __pycache__/

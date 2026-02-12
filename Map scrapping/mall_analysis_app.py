@@ -33,14 +33,32 @@ if not os.path.exists(IMAGES_DIR):
 
 
 def _load_shared_map_url() -> str:
-    """If main dashboard submitted data, pre-fill the Mall Map URL."""
-    shared = Path(__file__).resolve().parent.parent / "shared_dashboard_input.json"
-    if not shared.exists():
-        return ""
+    """Pre-fill only when opened from main UI with matching one-time token; otherwise return empty so refresh doesn't show old data."""
+    APP_KEY = "map_dashboard"
+    root = Path(__file__).resolve().parent.parent
+    shared = root / "shared_dashboard_input.json"
+    token_file = root / "shared_dashboard_delivery_token.json"
     try:
-        with open(shared, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return (data.get("map_visual_url") or "").strip()
+        params = getattr(st, "query_params", None) or st.experimental_get_query_params()
+        param_token = params.get("from_dashboard")
+        param_app = params.get("app")
+        if isinstance(param_token, list):
+            param_token = param_token[0] if param_token else None
+        if isinstance(param_app, list):
+            param_app = param_app[0] if param_app else None
+        if not param_token or param_app != APP_KEY or not token_file.exists():
+            return ""
+        tokens = json.loads(token_file.read_text(encoding="utf-8"))
+        if tokens.get(APP_KEY) != param_token:
+            return ""
+        data = json.loads(shared.read_text(encoding="utf-8")) if shared.exists() else {}
+        url = (data.get("map_visual_url") or "").strip()
+        try:
+            tokens[APP_KEY] = ""
+            token_file.write_text(json.dumps(tokens), encoding="utf-8")
+        except Exception:
+            pass
+        return url
     except Exception:
         return ""
 

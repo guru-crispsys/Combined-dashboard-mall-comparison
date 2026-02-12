@@ -146,6 +146,16 @@ def start_app(cwd: Path, script: str, preferred_port: int) -> int:
 
 st.set_page_config(page_title="Combined Dashboard", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
+# One-time delivery token per app: when an app loads with a matching token, it pre-fills then clears its token so refresh won't pre-fill again.
+import uuid
+DELIVERY_TOKEN_FILE = ROOT / "shared_dashboard_delivery_token.json"
+if "delivery_tokens" not in st.session_state:
+    st.session_state.delivery_tokens = {app["key"]: str(uuid.uuid4()) for app in APPS}
+try:
+    DELIVERY_TOKEN_FILE.write_text(json.dumps(st.session_state.delivery_tokens), encoding="utf-8")
+except Exception:
+    pass
+
 # Start apps on first load (once per browser session) so links open immediately.
 # We also remember the *actual* port each app was started on, since we may have
 # to move to a different free port if the preferred one is already in use.
@@ -263,20 +273,17 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Load existing shared input for pre-fill
-_prev = load_shared_input()
-
 with st.expander("📝 Mall & search inputs (optional — submit to pre-fill all three apps)", expanded=True):
-    st.markdown("Provide mall details and URLs below. After **Submit**, open Store Opening Discovery, Mall AI Dashboard, or Map Visual Analysis to use this data. If you leave fields empty, those apps run as usual and you can enter data there.")
+    st.markdown("Enter data below and click **Submit** to save. The three apps use whatever was last submitted — after you submit new data, open or refresh those apps to see it. Leave fields empty if you prefer to enter data inside each app.")
     with st.form("shared_input_form"):
-        mall_name = st.text_input("Mall Name", value=_prev.get("mall_name", ""), placeholder="e.g. Westfield Southcenter")
-        address = st.text_input("Address", value=_prev.get("address", ""), placeholder="Full address")
-        official_website = st.text_input("Official Web Site", value=_prev.get("official_website", ""), placeholder="https://...")
-        mall_facebook_link = st.text_input("Mall Facebook Link", value=_prev.get("mall_facebook_link", ""), placeholder="https://www.facebook.com/...")
-        mall_instagram_link = st.text_input("Mall Instagram Link", value=_prev.get("mall_instagram_link", ""), placeholder="https://www.instagram.com/...")
-        hashtags_youtube_twitter = st.text_input("Hashtags for use in Youtube, X(Twitter) Posts", value=_prev.get("hashtags_youtube_twitter", ""), placeholder="#mall #shopping ...")
-        googlesearch_query = st.text_area("Search query for Store Opening Discovery", value=_prev.get("googlesearch_query", ""), placeholder="e.g. Latest update about [mall name] · Coming soon tenants at [mall name]", height=80)
-        map_visual_url = st.text_input("Mall Map URL (for Map Visual Analysis)", value=_prev.get("map_visual_url", ""), placeholder="e.g. https://www.simon.com/mall/midland-park-mall/map/#/")
+        mall_name = st.text_input("Mall Name", value="", placeholder="e.g. Westfield Southcenter")
+        address = st.text_input("Address", value="", placeholder="Full address")
+        official_website = st.text_input("Official Web Site", value="", placeholder="https://...")
+        mall_facebook_link = st.text_input("Mall Facebook Link", value="", placeholder="https://www.facebook.com/...")
+        mall_instagram_link = st.text_input("Mall Instagram Link", value="", placeholder="https://www.instagram.com/...")
+        hashtags_youtube_twitter = st.text_input("Hashtags for use in Youtube, X(Twitter) Posts", value="", placeholder="#mall #shopping ...")
+        googlesearch_query = st.text_area("Search query for Store Opening Discovery", value="", placeholder="e.g. Latest update about [mall name] · Coming soon tenants at [mall name]", height=80)
+        map_visual_url = st.text_input("Mall Map URL (for Map Visual Analysis)", value="", placeholder="e.g. https://www.simon.com/mall/midland-park-mall/map/#/")
         submitted = st.form_submit_button("Submit")
     if submitted:
         save_shared_input({
@@ -293,10 +300,12 @@ with st.expander("📝 Mall & search inputs (optional — submit to pre-fill all
 
 st.markdown("---")
 
-# Vertical list of cards
+# Vertical list of cards (include one-time token per app so pre-fill only when opened from here; refresh in app won't pre-fill)
+_tokens = st.session_state.get("delivery_tokens", {})
 for app in APPS:
     actual_port = st.session_state.app_ports.get(app["key"], app["port"])
-    url = f"http://localhost:{actual_port}"
+    tok = _tokens.get(app["key"], "")
+    url = f"http://localhost:{actual_port}/?from_dashboard={tok}&app={app['key']}" if tok else f"http://localhost:{actual_port}"
     button_label = f"Open {app['title']}"
     st.markdown(
         f"""
