@@ -8,6 +8,7 @@ import json
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -83,19 +84,28 @@ def load_shared_input() -> dict:
     default = {
         "mall_name": "",
         "address": "",
+        "mall_homepage": "",
         "official_website": "",
         "mall_facebook_link": "",
         "mall_instagram_link": "",
         "hashtags_youtube_twitter": "",
         "googlesearch_query": "",
         "map_visual_url": "",
+        "num_posts_to_scrape": 20,
     }
     if not SHARED_INPUT_FILE.exists():
         return default
     try:
         with open(SHARED_INPUT_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {**default, **{k: str(v).strip() if v is not None else "" for k, v in data.items()}}
+        # Handle num_posts_to_scrape separately to preserve integer type
+        result = {**default, **{k: str(v).strip() if v is not None else "" for k, v in data.items() if k != "num_posts_to_scrape"}}
+        if "num_posts_to_scrape" in data:
+            try:
+                result["num_posts_to_scrape"] = int(data["num_posts_to_scrape"])
+            except (ValueError, TypeError):
+                result["num_posts_to_scrape"] = default["num_posts_to_scrape"]
+        return result
     except Exception:
         return default
 
@@ -159,9 +169,12 @@ except Exception:
 # Start apps on first load (once per browser session) so links open immediately.
 # We also remember the *actual* port each app was started on, since we may have
 # to move to a different free port if the preferred one is already in use.
+# Delay between starts so each app has time to bind before we pick the next port.
 if "app_ports" not in st.session_state:
     st.session_state.app_ports = {}
-    for app in APPS:
+    for i, app in enumerate(APPS):
+        if i > 0:
+            time.sleep(4)  # Wait for previous app to bind before checking ports
         actual_port = start_app(app["cwd"], app["script"], app["port"])
         st.session_state.app_ports[app["key"]] = actual_port
 
@@ -274,29 +287,87 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.expander("📝 Mall & search inputs (optional — submit to pre-fill all three apps)", expanded=True):
-    st.markdown("Enter data below and click **Submit** to save. The three apps use whatever was last submitted — after you submit new data, open or refresh those apps to see it. Leave fields empty if you prefer to enter data inside each app.")
+    st.markdown("Enter data below and click **Submit** to save. The three apps use whatever was last submitted. Fields appear empty on refresh — saved data remains available to the apps.")
+    
     with st.form("shared_input_form"):
-        mall_name = st.text_input("Mall Name", value="", placeholder="e.g. Westfield Southcenter")
-        address = st.text_input("Address", value="", placeholder="Full address")
-        official_website = st.text_input("Official Web Site", value="", placeholder="https://...")
+        mall_name = st.text_input("Mall Name", value="", placeholder="")
+        address = st.text_input("Address *", value="", placeholder="Required", help="Required field")
+        mall_homepage = st.text_input("Official Mall Website Homepage", value="", placeholder="https://...")
+        official_website = st.text_input("Official Web Site Stores directory", value="", placeholder="https://...")
         mall_facebook_link = st.text_input("Mall Facebook Link", value="", placeholder="https://www.facebook.com/...")
         mall_instagram_link = st.text_input("Mall Instagram Link", value="", placeholder="https://www.instagram.com/...")
+        num_posts_to_scrape = st.number_input("Number of Posts to Scrape", min_value=1, max_value=1000, value=20, step=1, help="Default: 20 posts. This value is used for both Facebook and Instagram scraping.")
         hashtags_youtube_twitter = st.text_input("Hashtags for use in Youtube, X(Twitter) Posts", value="", placeholder="#mall #shopping ...")
         googlesearch_query = st.text_area("Search query for Store Opening Discovery", value="", placeholder="e.g. Latest update about [mall name] · Coming soon tenants at [mall name]", height=80)
-        map_visual_url = st.text_input("Mall Map URL (for Map Visual Analysis)", value="", placeholder="e.g. https://www.simon.com/mall/midland-park-mall/map/#/")
+        map_visual_url = st.text_input("Mall Map URL (for Map Visual Analysis)", value="", placeholder="e.g. https://www.eg.comm/mall-name/map/#/")
         submitted = st.form_submit_button("Submit")
     if submitted:
-        save_shared_input({
-            "mall_name": (mall_name or "").strip(),
-            "address": (address or "").strip(),
-            "official_website": (official_website or "").strip(),
-            "mall_facebook_link": (mall_facebook_link or "").strip(),
-            "mall_instagram_link": (mall_instagram_link or "").strip(),
-            "hashtags_youtube_twitter": (hashtags_youtube_twitter or "").strip(),
-            "googlesearch_query": (googlesearch_query or "").strip(),
-            "map_visual_url": (map_visual_url or "").strip(),
-        })
-        st.success("Saved. Open Store Opening Discovery, Mall AI Dashboard, or Map Visual Analysis to use this data.")
+        if not (address or "").strip():
+            st.error("Address is required. Please enter the mall address.")
+        else:
+            save_shared_input({
+                "mall_name": (mall_name or "").strip(),
+                "address": (address or "").strip(),
+                "mall_homepage": (mall_homepage or "").strip(),
+                "official_website": (official_website or "").strip(),
+                "mall_facebook_link": (mall_facebook_link or "").strip(),
+                "mall_instagram_link": (mall_instagram_link or "").strip(),
+                "hashtags_youtube_twitter": (hashtags_youtube_twitter or "").strip(),
+                "googlesearch_query": (googlesearch_query or "").strip(),
+                "map_visual_url": (map_visual_url or "").strip(),
+                "num_posts_to_scrape": num_posts_to_scrape,
+            })
+            st.success("Saved. Open Store Opening Discovery, Mall AI Dashboard, or Map Visual Analysis to use this data.")
+
+st.markdown("---")
+
+# Merge Mall Tenants CSV with Excel Report (from Mall AI Dashboard + Map Scraping)
+with st.expander("🔗 Merge Mall Tenants with Excel Report", expanded=False):
+    st.markdown(
+        "Upload the **Mall Tenants CSV** (from Mall AI Dashboard / map scraping) and the **Excel report** (mall research output). "
+        "The merge will: replace **Proposed Floor Number** with the mall **floor**, fill **Proposed Shop Number** with **location_id**, "
+        "and add **Latitude** and **Longitude** columns next to Proposed Shop Number, matching rows by tenant name."
+    )
+    col_merge_1, col_merge_2 = st.columns(2)
+    with col_merge_1:
+        merge_csv = st.file_uploader(
+            "Mall Tenants CSV (e.g. mall_tenants_full.csv)",
+            type=["csv"],
+            key="merge_tenant_csv",
+            help="CSV with columns: name, location_id, floor, latitude, longitude",
+        )
+    with col_merge_2:
+        merge_excel = st.file_uploader(
+            "Excel Report (e.g. mall_research_output.xlsx)",
+            type=["xlsx"],
+            key="merge_excel_report",
+            help="Excel with sheet 'Existing Tennent Research'",
+        )
+    merge_btn = st.button("Merge and Download Excel", type="primary", key="merge_download_btn")
+    if merge_btn and merge_csv and merge_excel:
+        try:
+            from merge_tenant_excel import merge_tenant_csv_with_excel
+            csv_bytes = merge_csv.read()
+            excel_bytes = merge_excel.read()
+            out_bytes = merge_tenant_csv_with_excel(csv_bytes, excel_bytes)
+            st.session_state["merged_excel_bytes"] = out_bytes
+            st.success("Merge complete. Click **Download merged Excel** below to save.")
+        except Exception as e:
+            st.session_state.pop("merged_excel_bytes", None)
+            st.error(f"Merge failed: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+    elif merge_btn and (not merge_csv or not merge_excel):
+        st.warning("Please upload both the Mall Tenants CSV and the Excel report.")
+
+    if st.session_state.get("merged_excel_bytes"):
+        st.download_button(
+            label="Download merged Excel",
+            data=st.session_state["merged_excel_bytes"],
+            file_name="mall_research_output_merged.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_merged_excel",
+        )
 
 st.markdown("---")
 

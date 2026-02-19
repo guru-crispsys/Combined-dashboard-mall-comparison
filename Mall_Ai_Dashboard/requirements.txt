@@ -7,6 +7,8 @@ beautifulsoup4
 lxml
 openpyxl
 python-dotenv
+python-docx
+duckduckgo-search
 selenium>=4.8
 webdriver-manager>=4.0.0
 python-dotenv>=1.0.0

@@ -12,6 +12,28 @@ from facebook_scraper import scrape_facebook_simple
 from instagram import scrape_instagram_simple
 from excel_exporter import create_mall_excel_export
 
+def _load_num_posts_to_scrape() -> int:
+    """Load num_posts_to_scrape from shared input JSON. Returns default 20 if not found."""
+    root = Path(__file__).resolve().parent.parent
+    shared = root / "shared_dashboard_input.json"
+    if not shared.exists():
+        return 20
+    try:
+        data = json.loads(shared.read_text(encoding="utf-8"))
+        num_posts = data.get("num_posts_to_scrape", 20)
+        # Ensure it's an integer and within reasonable bounds
+        try:
+            num_posts = int(num_posts)
+            if num_posts < 1:
+                return 20
+            if num_posts > 1000:
+                return 1000
+            return num_posts
+        except (ValueError, TypeError):
+            return 20
+    except Exception:
+        return 20
+
 def _load_shared_urls() -> str:
     """Pre-fill when opened from main UI (has app param); clear token after use to prevent refresh pre-fill."""
     APP_KEY = "mall_dashboard"
@@ -350,13 +372,14 @@ if scrape_use_btn:
                             except Exception as e:
                                 st.warning(f"❌ Failed scraping website {url}: {e}")
                     
-                    # Scrape Facebook URLs (up to 20 posts per page)
+                    # Scrape Facebook URLs
+                    num_posts = _load_num_posts_to_scrape()
                     if facebook_urls:
                         for i, url in enumerate(facebook_urls, 1):
                             st.write(f"📘 Scraping Facebook ({i}/{len(facebook_urls)}): {url}")
                             try:
-                                # Scrape up to 20 posts per Facebook page
-                                df_fb = scrape_facebook_simple(fb_url=url, target_count=20)
+                                # Scrape posts per Facebook page (using value from main UI)
+                                df_fb = scrape_facebook_simple(fb_url=url, target_count=num_posts)
                                 if df_fb is not None and not df_fb.empty:
                                     combined_data.append(df_fb)
                                     st.success(f"✅ Scraped {len(df_fb)} items from Facebook page")
@@ -372,7 +395,7 @@ if scrape_use_btn:
                                 else:
                                     st.warning(f"❌ Failed scraping Facebook {url}: {error_msg}")
                     
-                    # Scrape Instagram URLs (up to 20 posts per profile)
+                    # Scrape Instagram URLs
                     if instagram_urls:
                         # Add small delay to ensure previous Chrome instances are fully closed
                         import time
@@ -380,11 +403,11 @@ if scrape_use_btn:
                         for i, url in enumerate(instagram_urls, 1):
                             st.write(f"📷 Scraping Instagram ({i}/{len(instagram_urls)}): {url}")
                             try:
-                                # Scrape up to 20 posts per Instagram profile
-                                df_ig = scrape_instagram_simple(ig_url=url, target_count=20)
+                                # Scrape posts per Instagram profile (using value from main UI)
+                                df_ig = scrape_instagram_simple(ig_url=url, target_count=num_posts)
                                 if df_ig is not None and not df_ig.empty:
                                     combined_data.append(df_ig)
-                                    st.success(f"✅ Scraped {len(df_ig)} items from Instagram profile (up to 20 posts)")
+                                    st.success(f"✅ Scraped {len(df_ig)} items from Instagram profile (up to {num_posts} posts)")
                             except Exception as e:
                                 error_msg = str(e)
                                 if "Chrome failed to start" in error_msg or "DevToolsActivePort" in error_msg:
@@ -584,6 +607,9 @@ if links_file and scrape_links_btn:
                         st.warning("⚠️ URLs were found but none passed validation. Please check the URLs in your file.")
                     combined = []
                     
+                    # Load num_posts_to_scrape from shared input (used for Facebook and Instagram)
+                    num_posts = _load_num_posts_to_scrape()
+                    
                     # Scrape website URLs
                     if website_urls:
                         st.info(f"Found {len(website_urls)} website URL(s) to scrape")
@@ -604,7 +630,7 @@ if links_file and scrape_links_btn:
                         for i, u in enumerate(facebook_urls, 1):
                             st.write(f"📘 Scraping Facebook ({i}/{len(facebook_urls)}): {u}")
                             try:
-                                dfc = scrape_facebook_simple(fb_url=u, target_count=30)
+                                dfc = scrape_facebook_simple(fb_url=u, target_count=num_posts)
                                 if dfc is not None and not dfc.empty:
                                     combined.append(dfc)
                                     st.success(f"✅ Scraped {len(dfc)} items from Facebook")
@@ -622,20 +648,20 @@ if links_file and scrape_links_btn:
                                 else:
                                     st.warning(f"❌ Failed scraping Facebook {u}: {error_msg}")
 
-                    # Scrape Instagram URLs (up to 20 posts per profile)
+                    # Scrape Instagram URLs
                     if instagram_urls:
                         # Add small delay to ensure previous Chrome instances are fully closed
                         import time
                         time.sleep(0.5)  # Reduced for faster startup
-                        st.info(f"Found {len(instagram_urls)} Instagram profile(s) to scrape (up to 20 posts each)")
+                        st.info(f"Found {len(instagram_urls)} Instagram profile(s) to scrape (up to {num_posts} posts each)")
                         for i, u in enumerate(instagram_urls, 1):
                             st.write(f"📷 Scraping Instagram ({i}/{len(instagram_urls)}): {u}")
                             try:
-                                # Scrape up to 20 posts per Instagram profile
-                                dfc = scrape_instagram_simple(ig_url=u, target_count=20)
+                                # Scrape posts per Instagram profile (using value from main UI)
+                                dfc = scrape_instagram_simple(ig_url=u, target_count=num_posts)
                                 if dfc is not None and not dfc.empty:
                                     combined.append(dfc)
-                                    st.success(f"✅ Scraped {len(dfc)} items from Instagram (up to 20 posts)")
+                                    st.success(f"✅ Scraped {len(dfc)} items from Instagram (up to {num_posts} posts)")
                                 else:
                                     st.warning(f"⚠️ No data extracted from Instagram profile {u}")
                             except Exception as e:
@@ -729,8 +755,75 @@ if st.session_state.scraped_preview_df is not None:
             else:
                 filename = "mall_combined_scraped_data.csv"
             st.download_button("⬇️ Download Combined Scraped CSV (Website + Facebook + Instagram)", data=csv_bytes, file_name=filename, key="download_scraped")
+            # Excel with only Existing Tenant Research tab (website + FB + IG data)
+            try:
+                from excel_exporter import create_existing_tenant_research_only_export
+                input_url_for_excel = st.session_state.get("scraped_urls", "") or input_url or ""
+                excel_buffer = create_existing_tenant_research_only_export(
+                    scraped_df=preview_df,
+                    structured_data=st.session_state.get("structured_data"),
+                    input_url=input_url_for_excel,
+                )
+                excel_bytes = excel_buffer.getvalue()
+                excel_filename = "existing_tenant_research.xlsx"
+                if input_url_for_excel:
+                    try:
+                        domain = urlparse(input_url_for_excel).netloc.replace("www.", "").split(".")[0]
+                        if domain:
+                            excel_filename = f"{domain}_existing_tenant_research.xlsx"
+                    except Exception:
+                        pass
+                st.download_button(
+                    "⬇️ Download Excel (Existing Tenant Research only, with FB + Instagram)",
+                    data=excel_bytes,
+                    file_name=excel_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_excel_scraped",
+                )
+            except Exception as e:
+                st.error(f"Failed to prepare Excel report for download: {e}")
         except Exception as e:
             st.error(f"Failed to prepare scraped CSV for download: {e}")
+
+        # Web Research + Word Report: use data to search the web, OpenAI generates report, output .docx
+        st.divider()
+        st.subheader("📄 Web Research → Word Report")
+        st.caption("Uses your data (tenant list, mall name) to search the web, then OpenAI generates a report. Not only scraped data.")
+        if st.button("🔍 Generate Word Report (Web Search + OpenAI)", key="generate_word_report"):
+            with st.spinner("Searching the web with your data, then generating report with OpenAI…"):
+                try:
+                    from word_report import create_mall_word_report
+                    input_url_for_word = st.session_state.get("scraped_urls", "") or input_url or ""
+                    word_buffer = create_mall_word_report(
+                        scraped_df=preview_df,
+                        structured_data=st.session_state.get("structured_data"),
+                        llm_json=st.session_state.get("llm_json"),
+                        input_url=input_url_for_word,
+                        do_web_research=True,  # always use web search + data
+                        mall_name_for_search=None,
+                    )
+                    st.session_state.word_report_bytes = word_buffer.getvalue()
+                    st.session_state.word_report_filename = "mall_research_report.docx"
+                    if input_url_for_word:
+                        try:
+                            domain = urlparse(input_url_for_word).netloc.replace("www.", "").split(".")[0]
+                            if domain:
+                                st.session_state.word_report_filename = f"{domain}_mall_research_report.docx"
+                        except Exception:
+                            pass
+                    st.success("Word report generated. Download below.")
+                except Exception as e:
+                    st.error(f"Failed to generate Word report: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+        if st.session_state.get("word_report_bytes"):
+            st.download_button(
+                "⬇️ Download Word Report (.docx)",
+                data=st.session_state.word_report_bytes,
+                file_name=st.session_state.get("word_report_filename", "mall_research_report.docx"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="download_word_report",
+            )
 
 # Show extracted text files for download
 if 'extracted_text_files' in st.session_state and st.session_state.extracted_text_files:
@@ -782,27 +875,6 @@ if 'merged_tenant_list' in st.session_state and st.session_state.merged_tenant_l
         except Exception as e:
             st.error(f"Failed to prepare merged tenant list for download: {e}")
 
-# Show merged tenant list if available
-if 'merged_tenant_list' in st.session_state and st.session_state.merged_tenant_list is not None:
-    merged_list = st.session_state.merged_tenant_list
-    with st.expander("📋 Updated Tenant List (Existing + New Shops)", expanded=True):
-        st.info(f"**Total shops in merged list:** {len(merged_list)}")
-        st.dataframe(merged_list)
-        
-        # Download button for merged tenant list
-        try:
-            csv_bytes = merged_list.to_csv(index=False).encode("utf-8")
-            filename = "updated_tenant_list.csv"
-            st.download_button(
-                "⬇️ Download Updated Tenant List (CSV)",
-                data=csv_bytes,
-                file_name=filename,
-                mime="text/csv",
-                key="download_merged_tenant_list"
-            )
-            st.success("✅ This file contains all existing tenants plus newly extracted shops (no duplicates)")
-        except Exception as e:
-            st.error(f"Failed to prepare merged tenant list for download: {e}")
 
 # Prefer persisted structured_data from session_state if available
 if st.session_state.structured_data:
@@ -930,12 +1002,11 @@ if structured_data:
                 # Read buffer as bytes to avoid Streamlit media storage issues
                 excel_bytes = buffer.getvalue()
                 st.download_button(
-                    "⬇️ Download Comprehensive Excel Report (4 Tabs)", 
+                    "⬇️ Download Comprehensive Excel Report (7 Tabs)", 
                     data=excel_bytes, 
                     file_name="mall_research_output.xlsx", 
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
                     key="download_excel_report",
-                    on_click="ignore"  # Prevent rerun so report stays visible
                 )
             except Exception as e:
                 st.error(f"Failed to export Excel: {e}")

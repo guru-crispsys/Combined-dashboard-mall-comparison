@@ -33,13 +33,19 @@ def compare_shops(old_csv, new_csv, preserve_source=False, website_only=False):
     # Keep original new_df for source-specific comparisons
     original_new_df = new_df.copy()
     
-    # If website_only is True, filter new_df to only include website data
-    # This ensures vacated shops are calculated only from website data comparison
-    # Facebook and Instagram are post data, not shop/tenant data
-    if website_only and has_source:
-        website_sources = [s for s in original_new_df['source'].unique() if 'website' in str(s).lower() or 'web' in str(s).lower()]
-        if website_sources:
-            new_df = original_new_df[original_new_df['source'].isin(website_sources)].copy()
+    # If website_only is True, filter BOTH old_df and new_df to only include website data
+    # This ensures vacated shops = website tenants from OLD that are no longer in website NEW
+    # Facebook and Instagram are post data, not shop/tenant data — exclude from comparison
+    if website_only:
+        if has_source:
+            website_sources = [s for s in original_new_df['source'].unique() if 'website' in str(s).lower() or 'web' in str(s).lower()]
+            if website_sources:
+                new_df = original_new_df[original_new_df['source'].isin(website_sources)].copy()
+        # Also filter old_df to website-only if it has source (e.g. from previous merged export)
+        if 'source' in old_df.columns:
+            old_website_sources = [s for s in old_df['source'].unique() if s and ('website' in str(s).lower() or 'web' in str(s).lower())]
+            if old_website_sources:
+                old_df = old_df[old_df['source'].isin(old_website_sources)].copy()
     
     # Normalize shop names for comparison
     old_df["shop_key"] = old_df["shop_name"].apply(normalize_text)

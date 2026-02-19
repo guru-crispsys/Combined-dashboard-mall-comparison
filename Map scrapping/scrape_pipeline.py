@@ -160,10 +160,209 @@ def scrape_brookefields(url):
             
     return all_tenants
 
-def scrape_mall_data(url):
+def prepare_map_state(driver):
+    """
+    Helper to handle cookies, overlays, and ensure the Map tab is active.
+    Shared by both Vision and Generic scrapers.
+    """
+    print("Preparing Map View (Cookies & Tabs)...", flush=True)
+    
+    # 1. DISMISS COOKIES / OVERLAYS (Aggressive & Multilingual)
+    print("  > Checking for cookie banners...", flush=True)
+    time.sleep(2) # Wait for banners to animate in
+    
+    # Common words for "Accept", "Allow", "Agree", "OK" in EN, DA, DE, ES, FR
+    accept_keywords = [
+        "accept", "agree", "allow", "permit", "consent", "okay", "got it",
+        "accepter", "godkend", "tillad", "forstået", # Danish
+        "akzeptieren", "zustimmen", "verstanden",    # German
+        "aceptar", "permitir", "entendido",          # Spanish
+        "autoriser", "oui"                           # French
+    ]
+    
+    # Construct lower-case translation logic for XPath 1.0 (Selenium)
+    # translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+    limit_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    lower_chars = "abcdefghijklmnopqrstuvwxyz"
+    
+    xpath_conditions = []
+    for kw in accept_keywords:
+        # Match text content or aria-label
+        xpath_conditions.append(f"contains(translate(text(), '{limit_chars}', '{lower_chars}'), '{kw}')")
+        xpath_conditions.append(f"contains(translate(@aria-label, '{limit_chars}', '{lower_chars}'), '{kw}')")
+    
+    # Combine into one massive OR query for efficiency (or chunk it if too long)
+    # We'll split into Button-like elements
+    tags = ["button", "a", "div[@role='button']"]
+    
+    for tag in tags:
+        for kw in accept_keywords:
+            # We iterate keywords to keep XPaths manageable / debuggable
+            xpath = f"//{tag}[contains(translate(text(), '{limit_chars}', '{lower_chars}'), '{kw}')]"
+            
+            # Refine: Ignore if text is too long (likely an article, not a button)
+            # XPath 1.0 doesn't have string-length in generic predicate easily mixed, so we filter in Python
+            try:
+                elems = driver.find_elements(By.XPATH, xpath)
+                for elem in elems:
+                    if not elem.is_displayed(): continue
+                    
+                    # Filter out non-buttons (long text)
+                    if len(elem.text.strip()) > 40: continue
+                    
+                    # Check dimensions - cookie buttons are usually somewhat substantial but not huge
+                    size = elem.size
+                    if size['width'] < 10 or size['height'] < 10: continue
+                    
+                    print(f"  > Found cookie candidate ({tag}): '{elem.text[:20]}...'", flush=True)
+                    try:
+                        # Try standard click
+                        elem.click()
+                    except:
+                        # Try JS click
+                        driver.execute_script("arguments[0].click();", elem)
+                    time.sleep(1)
+            except: pass
+
+    # Specific ID/Class Fallbacks for common CMPs
+    specific_selectors = [
+        "//button[@id='onetrust-accept-btn-handler']",
+        "//*[@id='CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll']",
+        "//*[@class='cc-btn cc-dismiss']",
+        "//*[@class='cc-btn cc-allow']",
+        "//button[contains(@class, 'cookie') and contains(@class, 'accept')]",
+        "//div[contains(@class, 'cookie')]//button",
+        "//*[@class='close']",
+        "//button[@aria-label='Close']"
+    ]
+    
+    for sel in specific_selectors:
+        try:
+            elems = driver.find_elements(By.XPATH, sel)
+            for elem in elems:
+                if elem.is_displayed():
+                    print(f"  > Dismissing overlay via selector: {sel}", flush=True)
+                    driver.execute_script("arguments[0].click();", elem)
+                    time.sleep(1)
+        except: pass
+
+    # 2. SWITCH TO MAP TAB (if not already there)
+    # We look for "Overview map", "Map", "Floor Plan", etc.
+    map_keywords = [
+        "Overview map", 
+        "Oversigtskort", 
+        "Kort over centret", 
+        "View Map", 
+        "Interactive Map",
+        "Map View",
+        "Floor Map",
+        "Directory",
+        "Map"
+    ]
+    
+    # Check if we are already on a map page (URL check)
+    # But sometimes the URL doesn't change much, or we are on the page but need to click a tab.
+    
+    found_tab = False
+    for keyword in map_keywords:
+        xpath = f"//*[contains(text(), '{keyword}')]"
+        try:
+            elems = driver.find_elements(By.XPATH, xpath)
+            for elem in elems:
+                if elem.is_displayed():
+                    # Filter out noise (e.g. footers)
+                    if len(elem.text.strip()) > 30: continue
+                    
+                    tag = elem.tag_name.lower()
+                    try:
+                        parent = elem.find_element(By.XPATH, "..")
+                        parent_tag = parent.tag_name.lower()
+                    except: parent_tag = ""
+                    
+                    if tag in ['a', 'button', 'li', 'span', 'div'] or parent_tag in ['a', 'button', 'li']:
+                        print(f"Switching to map tab: '{keyword}'", flush=True)
+                        try:
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
+                            time.sleep(1)
+                            driver.execute_script("arguments[0].click();", elem)
+                        except:
+                            elem.click()
+                        time.sleep(5) # Wait for map render
+                        found_tab = True
+                        break
+        except: pass
+        if found_tab: break
+    
+    # 3. Last Resort: Link with href='.../map'
+    if not found_tab:
+        try:
+             btns = driver.find_elements(By.XPATH, "//a[contains(@href, '/map')]")
+             for btn in btns:
+                 if btn.is_displayed():
+                     print(f"Found map link by href: {btn.get_attribute('href')}")
+                     driver.execute_script("arguments[0].click();", btn)
+                     time.sleep(5)
+                     break
+        except: pass
+
+
+
+# --- VISION-BASED SCRAPER ---
+def scrape_mall_with_vision(url):
+    """
+    Captures a screenshot of the mall map and extracts tenant data using Vision LLM.
+    """
+    print(f"Initializing Vision-Based Scraper for: {url}", flush=True)
+    driver = create_driver(headless=True)
+    if not driver:
+        print("Error: Webdriver failed to initialize.")
+        return None
+
+    try:
+        print(f"Navigating to target for vision capture...", flush=True)
+        driver.get(url)
+        time.sleep(12) # generous wait for map render
+        
+        # Robust Map Preparation (Cookies & Tabs)
+        prepare_map_state(driver)
+
+        # Take full window screenshot
+        screenshot_path = os.path.join(os.getcwd(), "map_capture_temp.png")
+        driver.save_screenshot(screenshot_path)
+        print(f"Screenshot captured: {screenshot_path}", flush=True)
+        
+        # Dynamic import to avoid circular dependencies
+        import sys
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if root_dir not in sys.path:
+            sys.path.append(root_dir)
+        
+        from Mall_Ai_Dashboard.llm_engine import extract_shops_from_image_via_llm
+        
+        print("Analyzing map image with AI Vision...", flush=True)
+        data = extract_shops_from_image_via_llm(screenshot_path, url)
+        
+        if data:
+            with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            print(f"Vision Success: Extracted {len(data)} tenants.")
+            return data
+        return None
+
+    except Exception as e:
+        print(f"Vision Scraper Error: {e}")
+        return None
+    finally:
+        try: driver.quit()
+        except: pass
+
+def scrape_mall_data(url, use_vision=False):
     """
     Unified Scraper Entry Point with Robust Session Management and Verification Bypass.
     """
+    if use_vision:
+        return scrape_mall_with_vision(url)
+
     # --- SITE-SPECIFIC SCRAPERS ---
     if "brookefields.com" in url:
         data = scrape_brookefields(url)
@@ -257,37 +456,8 @@ def scrape_mall_data(url):
         # 2. Check main content
         handle_captcha_elements(driver)
 
-        # --- DISMISS OVERLAYS ---
-        overlay_selectors = [
-            "//button[contains(text(), 'Accept')]",
-            "//button[contains(text(), 'Agree')]",
-            "//button[contains(text(), 'Close')]",
-            "//*[@class='close']"
-        ]
-        for sel in overlay_selectors:
-            try:
-                btns = driver.find_elements(By.XPATH, sel)
-                if btns and btns[0].is_displayed():
-                    btns[0].click()
-                    time.sleep(1)
-            except: continue
-
-        # --- ACTIVATE MAP ---
-        if "/map" not in driver.current_url.lower():
-            print("Switching to map view...", flush=True)
-            triggers = [
-                "//a[contains(text(), 'Map')]",
-                "//button[contains(text(), 'Map')]",
-                "//a[contains(@href, '/map/')]"
-            ]
-            for trigger in triggers:
-                try:
-                    btns = driver.find_elements(By.XPATH, trigger)
-                    if btns and btns[0].is_displayed():
-                        btns[0].click()
-                        time.sleep(3)
-                        break
-                except: continue
+        # Robust Map Preparation (Cookies & Tabs)
+        prepare_map_state(driver)
 
         # --- FINAL POLLING FOR NETWORK DATA ---
         print("Monitoring for map data registration...", flush=True)
@@ -438,6 +608,8 @@ def format_hours(hours_list):
         elif isinstance(hours_list, str): return hours_list
     except: return "Contact Store"
     return "; ".join(summary) if summary else "See Description"
+
+
 
 if __name__ == "__main__":
     import sys

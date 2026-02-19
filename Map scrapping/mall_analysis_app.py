@@ -33,84 +33,14 @@ if not os.path.exists(IMAGES_DIR):
 
 
 def _load_shared_map_url() -> str:
-    """Pre-fill when opened from main UI (has app param); clear token after use to prevent refresh pre-fill."""
-    APP_KEY = "map_dashboard"
-    root = Path(__file__).resolve().parent.parent
-    shared = root / "shared_dashboard_input.json"
-    token_file = root / "shared_dashboard_delivery_token.json"
-    
-    # Check if shared data exists
+    """If main dashboard submitted data, pre-fill the Mall Map URL."""
+    shared = Path(__file__).resolve().parent.parent / "shared_dashboard_input.json"
     if not shared.exists():
         return ""
-    
     try:
-        data = json.loads(shared.read_text(encoding="utf-8"))
-        url = (data.get("map_visual_url") or "").strip()
-        
-        if not url:
-            return ""
-        
-        # Check if we're coming from main UI (has app param)
-        try:
-            try:
-                params = st.query_params
-            except AttributeError:
-                params = st.experimental_get_query_params()
-            
-            param_app = params.get("app")
-            if isinstance(param_app, list):
-                param_app = param_app[0] if param_app else None
-            
-            # If app param matches, we're coming from main UI - pre-fill and clear token
-            if param_app == APP_KEY:
-                param_token = params.get("from_dashboard")
-                if isinstance(param_token, list):
-                    param_token = param_token[0] if param_token else None
-                
-                # Try to validate and clear token (but pre-fill regardless)
-                if token_file.exists() and param_token:
-                    try:
-                        tokens = json.loads(token_file.read_text(encoding="utf-8"))
-                        if tokens.get(APP_KEY) == param_token:
-                            # Token matches - clear it so refresh won't pre-fill again
-                            tokens[APP_KEY] = ""
-                            token_file.write_text(json.dumps(tokens), encoding="utf-8")
-                        else:
-                            # Token doesn't match - might be refresh, but still pre-fill on first load
-                            # Create cleared token so next refresh won't pre-fill
-                            tokens[APP_KEY] = ""
-                            token_file.write_text(json.dumps(tokens), encoding="utf-8")
-                    except Exception:
-                        # If token file read fails, create cleared token anyway
-                        try:
-                            tokens = {APP_KEY: ""}
-                            token_file.write_text(json.dumps(tokens), encoding="utf-8")
-                        except Exception:
-                            pass
-                else:
-                    # No token file or no token param - create cleared token so refresh won't pre-fill
-                    try:
-                        tokens = {APP_KEY: ""}
-                        token_file.write_text(json.dumps(tokens), encoding="utf-8")
-                    except Exception:
-                        pass
-                
-                return url
-            else:
-                # No app param or doesn't match - check if token was already cleared (refresh scenario)
-                if token_file.exists():
-                    try:
-                        tokens = json.loads(token_file.read_text(encoding="utf-8"))
-                        if tokens.get(APP_KEY) == "":
-                            # Token was cleared - this is a refresh, don't pre-fill
-                            return ""
-                    except Exception:
-                        pass
-                # No app param but token not cleared - might be direct access, don't pre-fill
-                return ""
-        except Exception:
-            # If query param reading fails, don't pre-fill (safety)
-            return ""
+        with open(shared, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return (data.get("map_visual_url") or "").strip()
     except Exception:
         return ""
 
@@ -140,42 +70,62 @@ def preprocess_image(image_path):
     """
     img = Image.open(image_path).convert("RGB")
     
-    # Increase resolution for better OCR on small labels (1800px is better for detail)
-    max_dim = 1800
+    # Advanced Enhancement Pipeline
+    img_gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+    
+    # 1. CLAHE (Contrast Limited Adaptive Histogram Equalization) for text visibility on backgrounds
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    img_gray = clahe.apply(img_gray)
+    
+    # 2. Localized Sharpening
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    img_sharpened = cv2.filter2D(img_gray, -1, kernel)
+    
+    # Convert back to RGB for PIL processing if needed, but OCR likes gray too
+    img = Image.fromarray(cv2.cvtColor(img_sharpened, cv2.COLOR_GRAY2RGB))
+    
+    # Increase resolution (3000px for extreme detail)
+    max_dim = 3000
     w, h = img.size
     if w > max_dim or h > max_dim:
         scale = max_dim / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     
-    # Advanced enhancement: Increase contrast and sharpness more precisely
-    img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Contrast(img).enhance(1.5)
-    img = ImageEnhance.Sharpness(img).enhance(2.0)
     return img
 
 def solve_latlon_to_pixel(valid_pts):
     """
-    Highly accurate coordinate projection for Mall Maps.
-    Includes data normalization for numeric stability.
+    Gold-standard coordinate projection with normalization and iterative refinement.
     """
     if len(valid_pts) < 3:
         return None, None, None
         
-    src_pts = np.array([[p['lon'], p['lat']] for p in valid_pts], dtype=np.float32)
-    dst_pts = np.array([[p['x'], p['y']] for p in valid_pts], dtype=np.float32)
+    src_pts = np.array([[p['lon'], p['lat']] for p in valid_pts], dtype=np.float64)
+    dst_pts = np.array([[p['x'], p['y']] for p in valid_pts], dtype=np.float64)
 
-    # Normalize coordinates to improve numeric stability of the solvers
-    # This is crucial when mapping small Lat/Lon to large pixel values
-    src_mean = src_pts.mean(axis=0)
-    dst_mean = dst_pts.mean(axis=0)
+    # 1. Normalization (Matrix Scaling/Translation for Numeric Stability)
+    src_mean = np.mean(src_pts, axis=0)
+    dst_mean = np.mean(dst_pts, axis=0)
+    src_std = np.std(src_pts, axis=0) + 1e-9
+    dst_std = np.std(dst_pts, axis=0) + 1e-9
     
+    src_norm = (src_pts - src_mean) / src_std
+    dst_norm = (dst_pts - dst_mean) / dst_std
+
+    # 2. Iterative RANSAC Solver
     if len(valid_pts) >= 4:
-        # Homography with stricter RANSAC for perspective correction
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 2.0)
+        # Homography with tight reprojection threshold (1.0px)
+        H_norm, mask = cv2.findHomography(src_norm, dst_norm, cv2.RANSAC, 1.0)
+        if H_norm is None: return None, None, None
+        
+        # Denormalize H
+        T_src = np.array([[1/src_std[0], 0, -src_mean[0]/src_std[0]], [0, 1/src_std[1], -src_mean[1]/src_std[1]], [0, 0, 1]])
+        T_dst_inv = np.array([[dst_std[0], 0, dst_mean[0]], [0, dst_std[1], dst_mean[1]], [0, 0, 1]])
+        H = T_dst_inv @ H_norm @ T_src
         return H, "homography", mask
     else:
-        # Affine with RANSAC for 2D flat maps
-        M, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=2.0)
+        # Affine with LMEDS for small point sets
+        M, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.LMEDS)
         return M, "affine", mask
 
 def run_analysis(image_path, reader, sbert_model, tenants, json_embeddings, threshold=0.6):
@@ -268,11 +218,12 @@ def run_analysis(image_path, reader, sbert_model, tenants, json_embeddings, thre
                     entry.update({"Status": "Missing", "MatchCandidate": "-", "Score": 0.0, "BBox": None})
                 match_results.append(entry)
 
-    # 3. Georeferencing Overlay with Floor Detection
+    # 3. Georeferencing Overlay with Priority Anchors
     initial_anchors = []
     found_floors = []
+    # FIRST PASS: Highest confidence only (0.85+)
     for r in match_results:
-        if r['Status'] == 'Found' and r['Score'] > 0.8 and r.get('Latitude') and r.get('Longitude'):
+        if r['Status'] == 'Found' and r['Score'] > 0.85 and r.get('Latitude') and r.get('Longitude'):
             (tl, tr, br, bl) = r['BBox']
             initial_anchors.append({
                 'lat': r['Latitude'], 'lon': r['Longitude'], 
@@ -280,8 +231,18 @@ def run_analysis(image_path, reader, sbert_model, tenants, json_embeddings, thre
             })
             found_floors.append(r['Floor'])
 
-    # Determine the most likely floor shown in this image
-    detected_floor = Counter(found_floors).most_common(1)[0][0] if found_floors else None
+    # FALLBACK: If not enough high-confidence anchors, relax to 0.7
+    if len(initial_anchors) < 4:
+        for r in match_results:
+            if r['Status'] == 'Found' and 0.7 <= r['Score'] <= 0.85 and r.get('Latitude') and r.get('Longitude'):
+                (tl, tr, br, bl) = r['BBox']
+                initial_anchors.append({
+                    'lat': r['Latitude'], 'lon': r['Longitude'], 
+                    'x': (tl[0] + br[0]) / 2, 'y': (tl[1] + br[1]) / 2
+                })
+
+    # Support multiple detected floors in a single image (e.g. multi-level maps side-by-side)
+    detected_floors = set(found_floors) if found_floors else set()
 
     if len(initial_anchors) >= 3:
         M, transform_type, mask = solve_latlon_to_pixel(initial_anchors)
@@ -298,24 +259,21 @@ def run_analysis(image_path, reader, sbert_model, tenants, json_embeddings, thre
                     (tl, tr, br, bl) = r['BBox']
                     occupied_rects.append((int(tl[0]-5), int(tl[1]-5), int(br[0]+5), int(br[1]+5)))
 
-            # Mark missing tenants (ONLY for the detected floor to improve accuracy/clutter)
+            # Mark missing tenants (Ensures total coverage of the database)
             for r in match_results:
                 if r['Status'] == 'Missing' and r.get('Latitude') and r.get('Longitude'):
-                    # SKIP if tenant belongs to a different floor than the one we detected
-                    if detected_floor and r['Floor'] != detected_floor:
-                        continue
-                        
                     lon, lat = r['Longitude'], r['Latitude']
                     if transform_type == "homography":
-                        # Standard matrix projection
                         denom = M[2,0]*lon + M[2,1]*lat + M[2,2]
+                        if abs(denom) < 1e-6: continue
                         px = (M[0,0]*lon + M[0,1]*lat + M[0,2]) / denom
                         py = (M[1,0]*lon + M[1,1]*lat + M[1,2]) / denom
                     else:
                         px = M[0,0]*lon + M[0,1]*lat + M[0,2]
                         py = M[1,0]*lon + M[1,1]*lat + M[1,2]
 
-                    if 15 <= px < w-15 and 15 <= py < h-15:
+                    # If projected coordinates are within view, we MARK IT to avoid missing any list entry
+                    if 10 <= px < w-10 and 10 <= py < h-10:
                         # Draw Marker: Concentric circles for high visibility
                         cv2.circle(missing_map_img, (int(px), int(py)), 4, (255, 255, 255), -1, cv2.LINE_AA)
                         cv2.circle(missing_map_img, (int(px), int(py)), 2, (0, 0, 255), -1, cv2.LINE_AA)
@@ -330,12 +288,16 @@ def run_analysis(image_path, reader, sbert_model, tenants, json_embeddings, thre
                         # Try placing label in sorted order of preference
                         best_pos = None
                         offsets = [
-                            (10, -5),   # Top Right
-                            (10, 10),   # Bottom Right
-                            (-lw-10, -5), # Top Left
-                            (-lw-10, 10), # Bottom Left
-                            (-lw/2, -15), # Directly Above
-                            (-lw/2, 20)   # Directly Below
+                            (12, -8),   # Top Right (adjusted)
+                            (12, 12),   # Bottom Right
+                            (-lw-12, -8), # Top Left
+                            (-lw-12, 12), # Bottom Left
+                            (-lw/2, -18), # Directly Above
+                            (-lw/2, 25),  # Directly Below
+                            (5, -20),    # Steep Angle Above
+                            (5, 20),     # Steep Angle Below
+                            (-lw-5, -20),
+                            (-lw-5, 20)
                         ]
                         
                         for ox, oy in offsets:
@@ -419,20 +381,22 @@ def main():
             _prefilled_map_url = _load_shared_map_url()
             mall_url = st.text_input("Mall Map URL", value=_prefilled_map_url, placeholder="https://www.simon.com/mall/midland-park-mall/map/#/")
             
+            use_vision = st.checkbox("Use Vision AI (for Image format mall maps)", value=False, help="Enable this if the mall map is a canvas or image and standard scraping fails. It captures a screenshot and uses AI to read the legend.")
+            
             sc_col1, sc_col2 = st.columns(2)
             with sc_col1:
                 if st.button("🔄 Run Scraper", use_container_width=True):
                     if not mall_url:
                         st.error("Please enter a valid Mall Map URL.")
                     else:
-                        with st.spinner("Scraping Mall Data..."):
-                            data = scrape_mall_data(mall_url)
+                        with st.spinner(" Scraping Mall Map Tenants Data (AI Vision)..." if use_vision else "Scraping Mall Map Tenants Data..."):
+                            data = scrape_mall_data(mall_url, use_vision=use_vision)
                             if data:
                                 st.session_state.tenants = data
                                 st.success(f"Scraped {len(data)} tenants!")
                                 st.rerun()
                             else:
-                                st.error("Scraping failed.")
+                                st.error("Scraping failed. Try toggling Vision AI mode.")
             
             with sc_col2:
                 if st.button("🗑️ Reset", use_container_width=True, help="Clear current session data"):
@@ -440,6 +404,45 @@ def main():
                     if 'analysis_results' in st.session_state:
                         del st.session_state['analysis_results']
                     st.rerun()
+
+            st.markdown("---")
+            st.markdown("**OR Manual Image Source**")
+            manual_map = st.file_uploader("Upload Official Map Image", type=['png', 'jpg', 'jpeg'], help="Upload a map with a legend to manually populate the database.")
+            
+            if manual_map:
+                if st.button("Scrape from Uploaded Image", use_container_width=True):
+                    with st.spinner("Extracting tenants from image..."):
+                        # Save temp file
+                        temp_path = os.path.join(os.getcwd(), "manual_upload_temp.png")
+                        with open(temp_path, "wb") as f:
+                            f.write(manual_map.getbuffer())
+                        
+                        # Dynamic import
+                        import sys
+                        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+                        if root_dir not in sys.path:
+                            sys.path.append(root_dir)
+                        from Mall_Ai_Dashboard.llm_engine import extract_shops_from_image_via_llm
+                        
+                        data = extract_shops_from_image_via_llm(temp_path)
+                        if data:
+                            # Convert to standard format
+                            processed_data = []
+                            for d in data:
+                                processed_data.append({
+                                    "name": d['name'],
+                                    "floor": d.get('floor', 'Level 1'),
+                                    "location_id": d.get('location_id', ''),
+                                    "description": d.get('description', ''),
+                                    "hours": "Not available",
+                                    "latitude": None,
+                                    "longitude": None
+                                })
+                            st.session_state.tenants = processed_data
+                            st.success(f"Extracted {len(processed_data)} tenants!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to extract data from image.")
 
             # Optional: Allow loading from disk if it exists, but keep it hidden/secondary
             if os.path.exists(JSON_DATA_PATH) and st.session_state.tenants is None:

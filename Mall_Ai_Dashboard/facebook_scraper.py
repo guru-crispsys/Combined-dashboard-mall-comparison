@@ -1352,13 +1352,14 @@ def extract_html_div_text(driver, max_posts=20) -> List[Dict]:
     # Check up to 3x max_posts to account for filtering (some may be page metadata)
     total = min(len(elements), max_posts * 3)
     
-    # Process only first max_posts posts with full "See more" clicking
+    # Process elements until we have enough posts
     for index in range(total):
         if len(texts) >= max_posts:
             break
-            
+        
+        element_processed = False
         retries = 2
-        while retries > 0:
+        while retries > 0 and not element_processed:
             try:
                 el = elements[index]
 
@@ -1411,7 +1412,9 @@ def extract_html_div_text(driver, max_posts=20) -> List[Dict]:
                     # treat this element as a post so it appears in the output.
                     base_text = raw_compact or raw_clean.strip()
                     if not base_text or len(base_text) < 10:
-                        break  # Too short to be meaningful, try next element
+                        # Too short to be meaningful, skip this element and move to next
+                        element_processed = True
+                        break
                     
                     processed = {
                         'caption': base_text[:200],
@@ -1463,7 +1466,9 @@ def extract_html_div_text(driver, max_posts=20) -> List[Dict]:
                     key_text = caption[:60] if caption else raw_text[:60]
                     # Allow shorter keys so we don't drop short-but-real posts
                     if not key_text or len(key_text.strip()) < 5:
-                        break  # Try next element
+                        # Text too short, skip this element and move to next
+                        element_processed = True
+                        break
                     
                     # Normalize the key (remove extra spaces, lowercase)
                     key = re.sub(r"\s+", " ", key_text.lower()).strip()
@@ -1472,13 +1477,31 @@ def extract_html_div_text(driver, max_posts=20) -> List[Dict]:
                     if key and key not in seen:
                         seen.add(key)
                         texts.append(processed)
-                        break  # Successfully added, move to next
+                        element_processed = True  # Successfully added, move to next element
+                        break
+                    else:
+                        # Duplicate post, skip it
+                        element_processed = True
+                        break
+                
+                # If we get here, element was processed (either added or skipped)
+                element_processed = True
                 break
+                
             except StaleElementReferenceException:
                 retries -= 1
-                time.sleep(0.2)
-                continue
-            except Exception:
+                if retries > 0:
+                    time.sleep(0.2)
+                    # Refresh elements list
+                    elements = driver.find_elements(By.XPATH, xpath)
+                    continue
+                else:
+                    # Out of retries, skip this element
+                    element_processed = True
+                    break
+            except Exception as e:
+                # Error processing this element, skip it and move to next
+                element_processed = True
                 break
 
     return texts
@@ -1895,10 +1918,43 @@ def scrape_facebook_simple(fb_url: str, target_count: int = 20) -> pd.DataFrame:
             print("Could not log in to Facebook")
             return pd.DataFrame(columns=['shop_name', 'phone', 'floor', 'source'])
 
-        # Wait until logged-in search box is present before continuing
-        wait.until(EC.presence_of_element_located((By.XPATH, "//input[@aria-label='Search Facebook']")))
+        # Verify login status with flexible checks (don't fail if search box selector changed)
+        try:
+            # Try multiple selectors for logged-in indicators
+            login_indicators = [
+                (By.XPATH, "//input[@aria-label='Search Facebook']"),
+                (By.XPATH, "//input[contains(@placeholder, 'Search')]"),
+                (By.XPATH, "//a[contains(@href, '/me')]"),  # Profile link
+                (By.XPATH, "//div[contains(@aria-label, 'Your profile')]"),
+                (By.XPATH, "//span[text()='Home']"),
+                (By.XPATH, "//nav"),  # Navigation bar
+            ]
+            
+            login_verified = False
+            for indicator_type, indicator_value in login_indicators:
+                try:
+                    WebDriverWait(driver, 3).until(
+                        EC.presence_of_element_located((indicator_type, indicator_value))
+                    )
+                    login_verified = True
+                    print("Login verified")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not login_verified:
+                # If we can't find any indicator, check URL - if not on login page, assume logged in
+                current_url = driver.current_url.lower()
+                if "login" not in current_url and "checkpoint" not in current_url:
+                    print("Login verified (by URL check)")
+                    login_verified = True
+                else:
+                    print("Warning: Could not verify login status, but continuing...")
+        except Exception as e:
+            print(f"Warning during login verification: {e}, but continuing...")
+        
         save_cookies(driver)
-        print("Logged in successfully")
+        print("Proceeding to scrape Facebook page...")
 
         # Navigate to target Facebook page directly (optimized)
         print(f"Opening Facebook page: {fb_url}")
@@ -1913,20 +1969,22 @@ def scrape_facebook_simple(fb_url: str, target_count: int = 20) -> pd.DataFrame:
             page_name = driver.title or "Facebook Page"
         print(f"\nOpened Page: {page_name}\n")
 
-        # Collect posts by scrolling thoroughly (optimized for speed)
+        # Collect posts by scrolling thoroughly
         collected = []
         seen = set()
-        max_scrolls = 80  # Reduced from 120 - enough to get 20 posts
-        pause = 1.5  # Reduced from 2.5 for faster scrolling
-        stable_threshold = 3  # Reduced from 4 to stop earlier
-        print(f"Scrolling to load posts (max {max_scrolls} scrolls)...")
+        # Increase scrolling to ensure we get enough posts
+        max_scrolls = max(100, target_count * 5)  # Scroll more for higher target counts
+        pause = 2.0  # Slightly longer pause to ensure posts load
+        stable_threshold = 4  # Wait a bit longer before stopping
+        print(f"Scrolling to load posts (target: {target_count}, max {max_scrolls} scrolls)...")
         final_count = scroll_to_load_all(driver, xpath=POST_XPATH, max_scrolls=max_scrolls, pause=pause, stable_threshold=stable_threshold, target_count=target_count)
         print(f"Finished scrolling; {final_count} post elements present. Extracting posts...")
 
         # Extract posts. Ask extractor for more than we finally need so that
-        # filtering/dedup still leaves us at least target_count posts that have
-        # real per-post URLs (not just the page URL).
-        max_posts_to_extract = min(120, max(target_count * 4, 40))
+        # filtering/dedup still leaves us at least target_count posts
+        # Extract at least 2x target_count to account for filtering
+        max_posts_to_extract = max(target_count * 2, 50)
+        print(f"Extracting up to {max_posts_to_extract} posts (target: {target_count})...")
         all_posts = extract_html_div_text(driver, max_posts=max_posts_to_extract)
         added = 0
         

@@ -105,6 +105,108 @@ def _call_openai_chat(
         return None
 
 
+def extract_serp_with_ai(serp_items: list, tenant_names: list) -> list:
+    """
+    Use AI to clean and extract structured information from SERP API results,
+    and optionally match each result to a tenant/shop name from the mall directory.
+
+    Args:
+        serp_items: List of dicts with keys title, snippet, link, source (from SerpApi).
+        tenant_names: List of tenant/shop names from the mall directory (for matching).
+
+    Returns:
+        List of dicts with keys: title (cleaned extracted info), snippet (optional extra),
+        link, matched_tenant (tenant name if the result is about that shop, else null).
+        If AI fails or is unavailable, returns the original items with matched_tenant=None.
+    """
+    if not serp_items:
+        return []
+    if not OPENAI_API_KEY:
+        return [
+            {**item, "matched_tenant": None}
+            for item in serp_items
+        ]
+
+    # Build input text for the model (truncate if very long)
+    tenant_list = ", ".join(str(n).strip() for n in tenant_names[:80] if n and str(n).strip())
+    lines = []
+    for i, item in enumerate(serp_items[:25], 1):
+        title = (item.get("title") or "").strip()
+        snippet = (item.get("snippet") or "").strip()
+        link = (item.get("link") or "").strip()
+        source = (item.get("source") or "").strip()
+        lines.append(f"[Item {i}]\nTitle: {title}\nSnippet: {snippet}\nURL: {link}\nSource: {source}")
+    input_text = "\n\n".join(lines)
+    if len(input_text) > 12000:
+        input_text = input_text[:12000] + "\n\n... (truncated)"
+
+    prompt = f"""You are an expert at extracting and cleaning information from web search results about malls and retail.
+
+TASK: For each search result below, produce a CLEAN, structured summary suitable for a mall research Excel sheet. Remove emojis, replacement characters (□), and junk. Extract:
+- Mall or business name, address, contact info, hours, website/social links.
+- Any news, events, or general information about the mall or its tenants.
+
+TENANT/SHOP NAMES FROM THIS MALL (use these only for matching; do not invent names):
+{tenant_list or "(none provided)"}
+
+For each item, if the result is clearly ABOUT a specific tenant/shop from the list above, set "matched_tenant" to that exact tenant name. Otherwise set "matched_tenant" to null.
+
+INPUT (raw SERP results):
+{input_text}
+
+OUTPUT: Return a JSON array. One object per input item, in the same order. Each object must have:
+- "title": string. Short cleaned headline (e.g. "Plaza Frontenac – Address, contact, hours").
+- "snippet": string. Clean extracted information (address, phone, hours, links, news). No emojis or □.
+- "link": string. The URL from the item (copy exactly).
+- "matched_tenant": string or null. Tenant name from the list if this result is about that shop; otherwise null.
+
+Return ONLY the JSON array, no markdown or explanation."""
+
+    raw = _call_openai_chat(
+        prompt,
+        temperature=0.1,
+        max_tokens=4096,
+        response_format="json_object",
+        timeout_seconds=90,
+    )
+    if not raw:
+        return [{**item, "matched_tenant": None} for item in serp_items]
+
+    try:
+        # Handle optional markdown code block
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "items" in parsed:
+            items = parsed["items"]
+        elif isinstance(parsed, list):
+            items = parsed
+        else:
+            return [{**item, "matched_tenant": None} for item in serp_items]
+        out = []
+        for i, obj in enumerate(items):
+            if not isinstance(obj, dict):
+                continue
+            link = (obj.get("link") or "").strip()
+            if not link and i < len(serp_items):
+                link = (serp_items[i].get("link") or "").strip()
+            out.append({
+                "title": str(obj.get("title") or "").strip() or (serp_items[i].get("title") if i < len(serp_items) else ""),
+                "snippet": str(obj.get("snippet") or "").strip() or (serp_items[i].get("snippet") if i < len(serp_items) else ""),
+                "link": link,
+                "source": (serp_items[i].get("source") or "").strip() if i < len(serp_items) else "",
+                "matched_tenant": obj.get("matched_tenant") if obj.get("matched_tenant") else None,
+            })
+        if out:
+            return out
+    except Exception as e:
+        print(f"Warning: Failed to parse AI SERP extraction: {e}")
+    return [{**item, "matched_tenant": None} for item in serp_items]
+
+
 def extract_shops_from_text(cleaned_text: str, url: str = "") -> list:
     """Extract shop names and details from cleaned website text using LLM.
     
@@ -940,3 +1042,4 @@ Generate a CLEAR, UNDERSTANDABLE report from the actual data provided.
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+

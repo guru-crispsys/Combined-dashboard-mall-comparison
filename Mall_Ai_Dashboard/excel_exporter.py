@@ -103,15 +103,93 @@ def create_mall_excel_export(
             import traceback
             traceback.print_exc()
     
+    # Fetch SERP news/blogs for mall (mall name + address from main UI)
+    # Use same query style as terminal so Excel "Google SERP Scratch" matches: title-case mall name, full results.
+    google_search_results = []
+    try:
+        mall_name = metadata.get("mall_name") or ""
+        address = metadata.get("address") or ""
+        if (not mall_name or mall_name == "Not Available") or (not address or address == "Not Available"):
+            # Try shared_dashboard_input.json from main UI
+            _root = __file__
+            for _ in range(2):
+                _root = __import__("os").path.dirname(_root)
+            _shared = __import__("pathlib").Path(_root) / "shared_dashboard_input.json"
+            if _shared.exists():
+                _data = __import__("json").loads(_shared.read_text(encoding="utf-8"))
+                if not mall_name or mall_name == "Not Available":
+                    mall_name = (_data.get("mall_name") or "").strip()
+                if not address or address == "Not Available":
+                    address = (_data.get("address") or "").strip()
+        mall_name = mall_name if mall_name and mall_name != "Not Available" else ""
+        address = address if address and address != "Not Available" else ""
+        # Normalize for SERP: title-case mall name so we get same news-style results as terminal (e.g. "Plaza Frontenac")
+        if mall_name:
+            mall_name = " ".join(w.capitalize() for w in mall_name.split())
+        if mall_name or address:
+            from serp_news_scraper import fetch_mall_news
+            google_search_results = fetch_mall_news(mall_name, address, max_results=15)
+    except Exception as e:
+        pass
+
     # Create tabs
     _create_meta_data_tab(wb, metadata)
-    _create_existing_tenants_tab(wb, scraped_df, structured_data)
+    _create_existing_tenants_tab(wb, scraped_df, structured_data, google_search_results=google_search_results)
     _create_coming_soon_tab(wb, structured_data, coming_soon_shops=coming_soon_shops)
     _create_vacated_shops_tab(wb, structured_data)
     _create_ai_analysis_tab(wb, llm_json, structured_data)
     _create_facebook_scratch_tab(wb, scraped_df)
     _create_instagram_scratch_tab(wb, scraped_df)
+    _create_serp_scratch_tab(wb, google_search_results)
     
+    wb.save(output_buffer)
+    output_buffer.seek(0)
+    return output_buffer
+
+
+def create_existing_tenant_research_only_export(
+    scraped_df=None,
+    structured_data=None,
+    input_url="",
+    output_buffer=None,
+):
+    """
+    Create an Excel file with only the Existing Tenant Research tab (website + FB + IG data).
+    """
+    from io import BytesIO
+
+    if output_buffer is None:
+        output_buffer = BytesIO()
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    # For existing-tenant-only export, fetch SERP so column L/M can be filled
+    google_search_results = []
+    try:
+        metadata = _extract_metadata(input_url, None)
+        mall_name = (metadata.get("mall_name") or "").strip()
+        address = (metadata.get("address") or "").strip()
+        if (not mall_name or mall_name == "Not Available") or (not address or address == "Not Available"):
+            _root = __file__
+            for _ in range(2):
+                _root = __import__("os").path.dirname(_root)
+            _shared = __import__("pathlib").Path(_root) / "shared_dashboard_input.json"
+            if _shared.exists():
+                _data = __import__("json").loads(_shared.read_text(encoding="utf-8"))
+                if not mall_name or mall_name == "Not Available":
+                    mall_name = (_data.get("mall_name") or "").strip()
+                if not address or address == "Not Available":
+                    address = (_data.get("address") or "").strip()
+        mall_name = mall_name if mall_name and mall_name != "Not Available" else ""
+        address = address if address and address != "Not Available" else ""
+        if mall_name:
+            mall_name = " ".join(w.capitalize() for w in mall_name.split())
+        if mall_name or address:
+            from serp_news_scraper import fetch_mall_news
+            google_search_results = fetch_mall_news(mall_name, address, max_results=15)
+    except Exception:
+        pass
+    _create_existing_tenants_tab(wb, scraped_df, structured_data, google_search_results=google_search_results)
     wb.save(output_buffer)
     output_buffer.seek(0)
     return output_buffer
@@ -168,6 +246,84 @@ def _match_post_to_tenant(post_text, tenant_name):
     Prefer using _score_post_for_tenant when choosing between multiple tenants.
     """
     return _score_post_for_tenant(post_text, tenant_name) > 0
+
+
+def _assign_serp_results_to_tenants(google_search_results, tenant_data):
+    """
+    Assign each SERP news/blog result to the best-matching tenant row (like Facebook/Instagram).
+    Returns list of (google_info_text, google_url_text) per tenant, same length as tenant_data.
+    """
+    from serp_news_scraper import format_news_for_excel
+    per_tenant = [[] for _ in tenant_data]
+    for item in google_search_results:
+        title = (item.get("title") or "").strip()
+        snippet = (item.get("snippet") or "").strip()
+        combined_text = f"{title}\n{snippet}".strip()
+        if not combined_text:
+            combined_text = title or snippet
+        best_idx = None
+        best_score = 0
+        for idx, tenant in enumerate(tenant_data):
+            tenant_name = tenant.get("name", "") or ""
+            if not tenant_name:
+                continue
+                score = _score_post_for_tenant(combined_text, tenant_name)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+        # Only assign when there is a positive match; otherwise keep item only in SERP Scratch
+        if best_idx is not None and best_score > 0:
+            per_tenant[best_idx].append(item)
+    # Format text and URLs for each tenant
+    out = []
+    for items in per_tenant:
+        text, urls = format_news_for_excel(items)
+        out.append((text, urls))
+    return out
+
+
+def _process_serp_for_tenants(google_search_results, tenant_data):
+    """
+    Process SERP results for Existing Tenant Research: use AI to extract/clean info and match
+    to tenants when possible; otherwise fall back to score-based assignment.
+    Returns list of (google_info_text, google_url_text) per tenant, same length as tenant_data.
+    """
+    from serp_news_scraper import format_news_for_excel
+    if not google_search_results or not tenant_data:
+        return [( "", "" )] * len(tenant_data) if tenant_data else []
+
+    tenant_names = [str(t.get("name") or "").strip() for t in tenant_data if t.get("name")]
+    try:
+        from llm_engine import extract_serp_with_ai
+        extracted = extract_serp_with_ai(google_search_results, tenant_names)
+    except Exception:
+        extracted = []
+
+    if not extracted:
+        return _assign_serp_results_to_tenants(google_search_results, tenant_data)
+
+    # Assign by matched_tenant: find tenant index by name (exact or first containing match).
+    # If no tenant is matched, do NOT assign; such rows will still appear in the
+    # Google SERP Scratch tab but not in Existing Tenant Research.
+    per_tenant = [[] for _ in tenant_data]
+    for item in extracted:
+        matched = item.get("matched_tenant")
+        if matched and matched.strip():
+            matched_clean = matched.strip()
+            target_idx = None
+            for idx, t in enumerate(tenant_data):
+                name = (t.get("name") or "").strip()
+                if name and (name == matched_clean or matched_clean in name or name in matched_clean):
+                    target_idx = idx
+                    break
+            if target_idx is not None:
+                per_tenant[target_idx].append(item)
+
+    out = []
+    for items in per_tenant:
+        text, urls = format_news_for_excel(items)
+        out.append((text, urls))
+    return out
 
 
 def _extract_metadata(input_url, llm_json=None):
@@ -403,19 +559,23 @@ def _create_meta_data_tab(wb, metadata):
     ws.column_dimensions['B'].width = 60
 
 
-def _create_existing_tenants_tab(wb, scraped_df, structured_data):
-    """Create Existing Tennent Research tab with tenant-matched Facebook/Instagram posts."""
+def _create_existing_tenants_tab(wb, scraped_df, structured_data, google_search_results=None):
+    """Create Existing Tennent Research tab with tenant-matched Facebook/Instagram posts.
+    google_search_results: list of dicts from SERP (news/blogs) to fill column L and M for first row.
+    """
+    if google_search_results is None:
+        google_search_results = []
     ws = wb.create_sheet("Existing Tennent Research")
     
     # Header style (dark maroon background)
     header_fill = PatternFill(start_color="800000", end_color="800000", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     
-    # Create headers
+    # Create headers (added column M: News/Blog URL)
     headers = [
         ["Si", "Proposed Floor Number", "Proposed Shop Number", "Tennent Name", 
          "Information from Mall Website", "Facebook Scrapping", "Facebook Post URL", "Facebook Date/Time",
-         "Instagram Scrapping", "Instagram Post URL", "Instagram Date/Time", "Google API Search"]
+         "Instagram Scrapping", "Instagram Post URL", "Instagram Date/Time", "Google API Search", "News/Blog URL"]
     ]
     
     # Write headers
@@ -433,6 +593,7 @@ def _create_existing_tenants_tab(wb, scraped_df, structured_data):
     ws.merge_cells('J1:J2')  # Instagram Post URL
     ws.merge_cells('K1:K2')  # Instagram Date/Time
     ws.merge_cells('L1:L2')  # Google API Search
+    ws.merge_cells('M1:M2')  # News/Blog URL
     
     # Write main header
     ws['B1'] = "Official Mall Directory List / Tennent Scrapping"
@@ -468,6 +629,9 @@ def _create_existing_tenants_tab(wb, scraped_df, structured_data):
     ws['L1'] = "Google API Search\nGeneral Information from Internet"
     ws['L1'].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     
+    ws['M1'] = "News/Blog URL\nURL of News or Blog"
+    ws['M1'].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    
     # Prepare tenant data - website data in column E, Facebook data in column F, Instagram data in column G
     tenant_data = []
     if scraped_df is not None and not scraped_df.empty:
@@ -492,8 +656,41 @@ def _create_existing_tenants_tab(wb, scraped_df, structured_data):
                 'facebook_info': '',
                 'instagram_info': '',
                 'instagram_datetime': '',
-                'google_info': ''
+                'google_info': '',
+                'google_url': ''
             })
+
+        # Fallback: if no website rows, populate Existing Tenant Research from all scraped rows
+        # so the sheet is never empty when there is scraped data (e.g. Facebook/Instagram only).
+        if not tenant_data:
+            for idx, (_, row) in enumerate(scraped_df.iterrows(), start=1):
+                src = str(row.get('source', '')).lower()
+                is_web = 'website' in src
+                name = row.get('shop_name', '') or row.get('post_text', '') or row.get('full_text', '') or '-'
+                tenant_data.append({
+                    'si': idx,
+                    'floor': row.get('floor', '-'),
+                    'shop_number': '-',
+                    'name': name,
+                    'website_info': 'Found' if is_web else '',
+                    'facebook_info': '',
+                    'instagram_info': '',
+                    'instagram_datetime': '',
+                    'google_info': '',
+                    'google_url': ''
+                })
+    
+    # Assign SERP news/blog results to tenant rows (AI extraction + tenant match, else score-based)
+    serp_per_tenant = []  # list of (google_info, google_url) per tenant
+    if google_search_results and tenant_data:
+        try:
+            serp_per_tenant = _process_serp_for_tenants(google_search_results, tenant_data)
+            for idx, (text, urls) in enumerate(serp_per_tenant):
+                if idx < len(tenant_data) and (text or urls):
+                    tenant_data[idx]["google_info"] = text
+                    tenant_data[idx]["google_url"] = urls
+        except Exception:
+            pass
     
     # Common alignment for text cells (wrap and top-align so long text goes to next line)
     wrapped_top_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
@@ -522,7 +719,11 @@ def _create_existing_tenants_tab(wb, scraped_df, structured_data):
         ws.cell(row=current_row, column=8, value='')  # Facebook Date/Time (initially empty)
         ws.cell(row=current_row, column=10, value='')  # Instagram Post URL (initially empty)
         ws.cell(row=current_row, column=11, value='')  # Instagram Date/Time (initially empty)
-        ws.cell(row=current_row, column=12, value=tenant['google_info'])  # Google API Search
+        # Google API Search (L) and News/Blog URL (M): tenant-matched SERP data (like Facebook/Instagram)
+        ws.cell(row=current_row, column=12, value=tenant['google_info'])
+        ws.cell(row=current_row, column=13, value=tenant.get('google_url', ''))
+        ws.cell(row=current_row, column=12).alignment = wrapped_top_align
+        ws.cell(row=current_row, column=13).alignment = wrapped_top_align
         current_row += 1
     
     # Match Facebook posts to tenant rows (choose BEST matching tenant per post)
@@ -669,10 +870,12 @@ def _create_existing_tenants_tab(wb, scraped_df, structured_data):
     ws.column_dimensions['E'].width = 40
     ws.column_dimensions['F'].width = 30  # Facebook Scrapping
     ws.column_dimensions['G'].width = 50  # Facebook Post URL
-    ws.column_dimensions['H'].width = 30  # Instagram Scrapping
-    ws.column_dimensions['I'].width = 50  # Instagram Post URL
-    ws.column_dimensions['J'].width = 25  # Instagram Date/Time
-    ws.column_dimensions['K'].width = 40  # Google API Search
+    ws.column_dimensions['H'].width = 30  # Facebook Date/Time
+    ws.column_dimensions['I'].width = 30  # Instagram Scrapping
+    ws.column_dimensions['J'].width = 50  # Instagram Post URL
+    ws.column_dimensions['K'].width = 25  # Instagram Date/Time
+    ws.column_dimensions['L'].width = 40  # Google API Search
+    ws.column_dimensions['M'].width = 50  # News/Blog URL
 
 
 def _create_coming_soon_tab(wb, structured_data, coming_soon_shops=None):
@@ -740,17 +943,41 @@ def _create_coming_soon_tab(wb, structured_data, coming_soon_shops=None):
     ws.column_dimensions['B'].width = 50
 
 
+def _is_likely_tenant_name(name):
+    """Return True if name looks like a real shop/tenant name, False if it looks like FB/IG post content."""
+    if not name or not isinstance(name, str):
+        return False
+    s = name.strip()
+    if len(s) < 2:
+        return False
+    # Exclude obvious social media content
+    s_lower = s.lower()
+    if any(x in s_lower for x in (
+        'instagram.com', 'facebook.com', 'fb.com', 'instagr.am',
+        'reel', '| ', ' |', 'sponsored by @', 'http://', 'https://',
+        'video sponsored', 'others |', ' | 3w |', ' | 1w |',
+        'post ', 'caption', '.reel', ' insta', ' at westfield', ' at mall',
+        ' others ', 'buy ', 'get 1 free', 'get one free', '... and '
+    )):
+        return False
+    # Exclude very long strings (post captions, not tenant names)
+    if len(s) > 50:
+        return False
+    return True
+
+
 def _create_vacated_shops_tab(wb, structured_data):
-    """Create Vacated Shops tab showing shops that were in old data but missing in new data"""
+    """Create Vacated Shops tab showing shops that were in old data but missing in new data.
+    Uses ONLY website/directory tenant data for comparison — Facebook and Instagram are excluded."""
     ws = wb.create_sheet("Vacated Shops")
     
     # Header style (dark maroon background)
     header_fill = PatternFill(start_color="800000", end_color="800000", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     
-    # Simple header - "Vacated Shops"
+    # Header - vacated shops based on website tenant list only
     ws.merge_cells('A1:D1')
-    cell = ws.cell(row=1, column=1, value="Vacated Shops (Shops that were in old data but are now missing)")
+    cell = ws.cell(row=1, column=1, value="Vacated Shops (Website directory only — shops in old data but missing from current website tenant list. Facebook/Instagram not used.)")
     cell.fill = header_fill
     cell.font = header_font
     cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -771,10 +998,13 @@ def _create_vacated_shops_tab(wb, structured_data):
         bottom=Side(style='thin')
     )
     
-    # Extract vacated shops from structured_data
+    # Extract vacated shops from structured_data (website-only comparison)
+    # vacated_shops at top level come from compare_shops(old_df, website_df, website_only=True)
     vacated_shops = []
     if structured_data and isinstance(structured_data, dict):
-        vacated_shops = structured_data.get("vacated_shops", [])
+        raw = structured_data.get("vacated_shops", [])
+        # First filter: exclude obvious Facebook/Instagram content (post captions, URLs, etc.)
+        vacated_shops = [s for s in raw if _is_likely_tenant_name(s.get("shop_name", ""))]
     
     # Validate shop names using AI to filter out non-shop entries (Facebook/Instagram post text, etc.)
     validated_vacated_shops = []
@@ -809,7 +1039,7 @@ def _create_vacated_shops_tab(wb, structured_data):
     if not vacated_shops:
         row = 3
         ws.merge_cells(f'A{row}:D{row}')
-        cell = ws.cell(row=row, column=1, value="No vacated shops found. All shops from old data are still present.")
+        cell = ws.cell(row=row, column=1, value="No vacated shops found. All shops from old data are still present in the website directory.")
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = thin_border
     else:
@@ -975,19 +1205,12 @@ def _create_ai_analysis_tab(wb, llm_json, structured_data=None):
             cell.alignment = Alignment(horizontal="center", vertical="center")
             row += 1
             
-            # List new shops
+            # List new shops (tenant name only)
             for shop in new_shops:
-                shop_name = shop.get('shop_name', '')
-                shop_floor = shop.get('floor', '-')
-                shop_phone = shop.get('phone', '-')
-                shop_text = f"{shop_name}"
-                if shop_floor and shop_floor != '-':
-                    shop_text += f" (Floor: {shop_floor})"
-                if shop_phone and shop_phone != '-':
-                    shop_text += f" (Phone: {shop_phone})"
-                
+                shop_name = shop.get('shop_name', '') or ''
                 ws.cell(row=row, column=1, value="•")
-                ws.cell(row=row, column=2, value=shop_text)
+                ws.cell(row=row, column=2, value=shop_name)
+                row += 1
                 row += 1
     
     # Auto-adjust column widths
@@ -995,8 +1218,25 @@ def _create_ai_analysis_tab(wb, llm_json, structured_data=None):
     ws.column_dimensions['B'].width = 80
 
 
+def _parse_post_date_for_sort(date_str):
+    """Parse post date string to datetime for sorting. Returns naive datetime (datetime.min for missing/invalid)."""
+    if not date_str or (isinstance(date_str, float) and pd.isna(date_str)) or str(date_str).strip() in ('', 'nan', '-'):
+        return datetime.min
+    try:
+        s = str(date_str).strip()
+        if 'T' in s or s.endswith('Z'):
+            dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        elif len(s) >= 10:
+            dt = datetime.fromisoformat(s[:19] if len(s) > 19 else s)
+        else:
+            return datetime.min
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception:
+        return datetime.min
+
+
 def _create_facebook_scratch_tab(wb, scraped_df):
-    """Create Facebook Scratch tab with all Facebook posts (SN, Date, Post, URL)."""
+    """Create Facebook Scratch tab with all Facebook posts (SN, Date, Post, URL). Sorted by date, latest first."""
     ws = wb.create_sheet("Facebook Scratch")
     
     # Header style (dark maroon background)
@@ -1066,18 +1306,24 @@ def _create_facebook_scratch_tab(wb, scraped_df):
                     if 'http' in possible_url or 'facebook.com' in possible_url or possible_url.startswith('www.'):
                         post_url = possible_url
 
+                raw_date = row.get('post_date', '')
                 facebook_posts.append({
                     'sn': idx,
                     'date': post_date if post_date else '-',
                     'post': post_text if post_text else '-',
-                    'url': post_url if post_url else '-'
+                    'url': post_url if post_url else '-',
+                    '_sort_key': _parse_post_date_for_sort(raw_date if pd.notna(raw_date) else '')
                 })
     
-    # Write data rows
+    # Sort by date, latest first
+    if facebook_posts:
+        facebook_posts.sort(key=lambda p: p['_sort_key'], reverse=True)
+    
+    # Write data rows (already sorted latest first)
     if facebook_posts:
         for row_idx, post in enumerate(facebook_posts, start=2):
-            # SN
-            cell_sn = ws.cell(row=row_idx, column=1, value=post['sn'])
+            # SN (re-number 1, 2, 3... after sort)
+            cell_sn = ws.cell(row=row_idx, column=1, value=row_idx - 1)
             cell_sn.border = thin_border
             cell_sn.alignment = center_align
             
@@ -1111,7 +1357,7 @@ def _create_facebook_scratch_tab(wb, scraped_df):
 
 
 def _create_instagram_scratch_tab(wb, scraped_df):
-    """Create Instagram Scratch tab with all Instagram posts (SN, Date/Time, Post, URL)."""
+    """Create Instagram Scratch tab with all Instagram posts (SN, Date/Time, Post, URL). Sorted by date, latest first."""
     ws = wb.create_sheet("Instagram Scratch")
 
     # Header style (dark maroon background)
@@ -1149,12 +1395,18 @@ def _create_instagram_scratch_tab(wb, scraped_df):
                 if not post_text and 'shop_name' in row:
                     post_text = str(row.get('shop_name', ''))
 
-                # Date/time - prefer datetime, then time
+                # Date/time - prefer datetime, then time, then post_date
                 post_dt = ''
+                raw_date_for_sort = ''
                 if 'datetime' in row and pd.notna(row.get('datetime')):
                     post_dt = str(row.get('datetime', ''))
+                    raw_date_for_sort = post_dt
                 elif 'time' in row and pd.notna(row.get('time')):
                     post_dt = str(row.get('time', ''))
+                    raw_date_for_sort = post_dt
+                elif 'post_date' in row and pd.notna(row.get('post_date')):
+                    post_dt = str(row.get('post_date', ''))
+                    raw_date_for_sort = post_dt
 
                 # Format datetime if ISO
                 if post_dt and post_dt.strip() and post_dt != 'nan':
@@ -1180,14 +1432,19 @@ def _create_instagram_scratch_tab(wb, scraped_df):
                     'sn': idx,
                     'date': post_dt if post_dt else '-',
                     'post': post_text if post_text else '-',
-                    'url': post_url if post_url else '-'
+                    'url': post_url if post_url else '-',
+                    '_sort_key': _parse_post_date_for_sort(raw_date_for_sort)
                 })
 
-    # Write data rows
+    # Sort by date, latest first
+    if instagram_posts:
+        instagram_posts.sort(key=lambda p: p['_sort_key'], reverse=True)
+
+    # Write data rows (already sorted latest first)
     if instagram_posts:
         for row_idx, post in enumerate(instagram_posts, start=2):
-            # SN
-            cell_sn = ws.cell(row=row_idx, column=1, value=post['sn'])
+            # SN (re-number 1, 2, 3... after sort)
+            cell_sn = ws.cell(row=row_idx, column=1, value=row_idx - 1)
             cell_sn.border = thin_border
             cell_sn.alignment = center_align
 
@@ -1217,3 +1474,53 @@ def _create_instagram_scratch_tab(wb, scraped_df):
     ws.column_dimensions['B'].width = 25  # Date/Time
     ws.column_dimensions['C'].width = 80  # Post
     ws.column_dimensions['D'].width = 60  # Post URL
+
+
+def _create_serp_scratch_tab(wb, google_search_results):
+    """Create Google SERP Scratch tab with all SERP API results (same structure as terminal output).
+    Columns: SN, Title, General Information (snippet), URL, Source, Date.
+    """
+    ws = wb.create_sheet("Google SERP Scratch")
+    header_fill = PatternFill(start_color="800000", end_color="800000", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    center_align = Alignment(horizontal="center", vertical="center")
+
+    headers = ["SN", "Title", "General Information", "URL", "Source", "Date"]
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = thin_border
+
+    if google_search_results:
+        for row_idx, item in enumerate(google_search_results, start=2):
+            ws.cell(row=row_idx, column=1, value=row_idx - 1)
+            ws.cell(row=row_idx, column=2, value=(item.get("title") or "").strip())
+            ws.cell(row=row_idx, column=3, value=(item.get("snippet") or "").strip())
+            ws.cell(row=row_idx, column=4, value=(item.get("link") or "").strip())
+            ws.cell(row=row_idx, column=5, value=(item.get("source") or "").strip())
+            ws.cell(row=row_idx, column=6, value=(item.get("date") or "").strip())
+            for c in range(1, 7):
+                cell = ws.cell(row=row_idx, column=c)
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    else:
+        ws.cell(row=2, column=1, value="No SERP API data found")
+        ws.merge_cells('A2:F2')
+        cell = ws.cell(row=2, column=1)
+        cell.alignment = center_align
+        cell.border = thin_border
+
+    ws.column_dimensions['A'].width = 8   # SN
+    ws.column_dimensions['B'].width = 35  # Title
+    ws.column_dimensions['C'].width = 60  # General Information
+    ws.column_dimensions['D'].width = 55  # URL
+    ws.column_dimensions['E'].width = 20  # Source
+    ws.column_dimensions['F'].width = 18  # Date
