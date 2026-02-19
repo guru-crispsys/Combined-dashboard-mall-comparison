@@ -1,0 +1,3 @@
+# Root deps for Railway/Railpack - main_ui.py (Streamlit)
+# Sub-apps (Mall_Ai_Dashboard, googlesearch, Map scrapping) have their own requirements.txt
+streamlit>=1.28.0
