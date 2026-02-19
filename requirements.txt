@@ -1,3 +1,26 @@
-# Root deps for Railway/Railpack - main_ui.py (Streamlit)
-# Sub-apps (Mall_Ai_Dashboard, googlesearch, Map scrapping) have their own requirements.txt
+# Combined deps for main_ui + googlesearch + Mall_Ai_Dashboard + Map scrapping (one build for all Railway services)
 streamlit>=1.28.0
+pandas
+requests
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+beautifulsoup4>=4.12.0
+lxml
+openpyxl>=3.1.0
+python-dotenv>=1.0.0
+# googlesearch
+google-genai>=1.0.0
+openai>=1.0.0
+# Mall_Ai_Dashboard
+python-docx
+duckduckgo-search
+selenium-wire>=5.1.0
+# Map scrapping
+easyocr
+sentence-transformers
+opencv-python
+numpy
+Pillow
+rapidfuzz
+undetected-chromedriver
+blinker==1.7.0

@@ -5,8 +5,8 @@ from PIL import Image, ImageOps, ImageEnhance
 import numpy as np
 import os
 from pathlib import Path
-import easyocr
-from sentence_transformers import SentenceTransformer, util
+# import easyocr
+# from sentence_transformers import SentenceTransformer, util
 import pandas as pd
 import cv2
 import glob
@@ -45,14 +45,14 @@ def _load_shared_map_url() -> str:
         return ""
 
 
-@st.cache_resource
-def load_models():
-    # Load OCR and Improved SBERT models
-    # ENABLE QUANTIZATION to fix memory error
-    reader = easyocr.Reader(['en'], gpu=False, verbose=False, quantize=True)
-    # Using 'all-MiniLM-L6-v2' for efficiency and accuracy in semantic matching
-    model = SentenceTransformer('all-MiniLM-L6-v2') 
-    return reader, model
+# @st.cache_resource
+# def load_models():
+#     # Load OCR and Improved SBERT models
+#     # ENABLE QUANTIZATION to fix memory error
+#     reader = easyocr.Reader(['en'], gpu=False, verbose=False, quantize=True)
+#     # Using 'all-MiniLM-L6-v2' for efficiency and accuracy in semantic matching
+#     model = SentenceTransformer('all-MiniLM-L6-v2') 
+#     return reader, model
 
 def load_json_data():
     if not os.path.exists(JSON_DATA_PATH):
@@ -128,205 +128,6 @@ def solve_latlon_to_pixel(valid_pts):
         M, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.LMEDS)
         return M, "affine", mask
 
-def run_analysis(image_path, reader, sbert_model, tenants, json_embeddings, threshold=0.6):
-    """
-    Analyzes a single image using improved OCR and cleaner visual markings.
-    """
-    # 1. OCR Preprocessing & Detection
-    image = preprocess_image(image_path)
-    img_np = np.array(image)
-    h, w = img_np.shape[:2]
-    
-    try:
-        # Tuning EasyOCR for map labels: paragraph=False avoids grouping unrelated stores
-        results = reader.readtext(img_np, detail=1, paragraph=False, min_size=5)
-    except Exception as e:
-        print(f"OCR Error: {e}")
-        return image, img_np, img_np, [], []
-
-    ocr_data = [] 
-    for (bbox, text, prob) in results:
-        # Map labels are often low contrast; keep anything above 0.15
-        if prob > 0.15:
-            ocr_data.append({"text": text, "bbox": bbox, "prob": prob})
-
-    ocr_texts = [d["text"] for d in ocr_data]
-    
-    # Layers
-    detection_img = img_np.copy()
-    missing_map_img = img_np.copy()
-    
-    # 2. Match with Database
-    json_names = [t['name'] for t in tenants if t['name']]
-    match_results = []
-    
-    if json_names and ocr_data and json_embeddings is not None:
-        valid_indices = [i for i, d in enumerate(ocr_data) if d["prob"] > 0.2]
-        valid_texts = [ocr_data[i]["text"] for i in valid_indices]
-        
-        if valid_texts:
-            ocr_embeddings = sbert_model.encode(valid_texts, convert_to_tensor=True, show_progress_bar=False)
-            cosine_scores = util.cos_sim(json_embeddings, ocr_embeddings).cpu().numpy()
-            
-            all_pair_scores = []
-            for i, j_name in enumerate(json_names):
-                for j, o_text in enumerate(valid_texts):
-                    sbert_score = float(cosine_scores[i][j])
-                    fuzzy_score = fuzz.token_set_ratio(j_name.lower(), o_text.lower()) / 100.0
-                    hybrid_score = (sbert_score * 0.7) + (fuzzy_score * 0.3)
-                    
-                    len_ratio = min(len(j_name), len(o_text)) / max(len(j_name), len(o_text))
-                    if len_ratio < 0.4:
-                        hybrid_score *= 0.7
-                    all_pair_scores.append((hybrid_score, i, j))
-            
-            all_pair_scores.sort(key=lambda x: x[0], reverse=True)
-            assigned_json = set()
-            assigned_ocr = set()
-            matched_map = {}
-            
-            for score, j_idx, o_idx in all_pair_scores:
-                if j_idx not in assigned_json and o_idx not in assigned_ocr:
-                    if score >= threshold:
-                        matched_map[j_idx] = (o_idx, score)
-                        assigned_json.add(j_idx)
-                        assigned_ocr.add(o_idx)
-            
-            for i, name in enumerate(json_names):
-                tenant_obj = tenants[i]
-                entry = {
-                    "Tenant": name,
-                    "Floor": tenant_obj.get('floor', 'Unknown'),
-                    "Latitude": tenant_obj.get('latitude'),
-                    "Longitude": tenant_obj.get('longitude'),
-                    "Description": tenant_obj.get('description', ''),
-                    "LocationID": tenant_obj.get('location_id', '')
-                }
-                
-                if i in matched_map:
-                    o_idx, b_score = matched_map[i]
-                    best_match_obj = ocr_data[valid_indices[o_idx]]
-                    entry.update({
-                        "Status": "Found",
-                        "MatchCandidate": best_match_obj["text"],
-                        "Score": b_score,
-                        "BBox": best_match_obj["bbox"]
-                    })
-                    (tl, tr, br, bl) = best_match_obj["bbox"]
-                    cv2.rectangle(detection_img, (int(tl[0]), int(tl[1])), (int(br[0]), int(br[1])), (0, 255, 0), 1)
-                else:
-                    entry.update({"Status": "Missing", "MatchCandidate": "-", "Score": 0.0, "BBox": None})
-                match_results.append(entry)
-
-    # 3. Georeferencing Overlay with Priority Anchors
-    initial_anchors = []
-    found_floors = []
-    # FIRST PASS: Highest confidence only (0.85+)
-    for r in match_results:
-        if r['Status'] == 'Found' and r['Score'] > 0.85 and r.get('Latitude') and r.get('Longitude'):
-            (tl, tr, br, bl) = r['BBox']
-            initial_anchors.append({
-                'lat': r['Latitude'], 'lon': r['Longitude'], 
-                'x': (tl[0] + br[0]) / 2, 'y': (tl[1] + br[1]) / 2
-            })
-            found_floors.append(r['Floor'])
-
-    # FALLBACK: If not enough high-confidence anchors, relax to 0.7
-    if len(initial_anchors) < 4:
-        for r in match_results:
-            if r['Status'] == 'Found' and 0.7 <= r['Score'] <= 0.85 and r.get('Latitude') and r.get('Longitude'):
-                (tl, tr, br, bl) = r['BBox']
-                initial_anchors.append({
-                    'lat': r['Latitude'], 'lon': r['Longitude'], 
-                    'x': (tl[0] + br[0]) / 2, 'y': (tl[1] + br[1]) / 2
-                })
-
-    # Support multiple detected floors in a single image (e.g. multi-level maps side-by-side)
-    detected_floors = set(found_floors) if found_floors else set()
-
-    if len(initial_anchors) >= 3:
-        M, transform_type, mask = solve_latlon_to_pixel(initial_anchors)
-        if M is not None:
-            inliers = mask.ravel().tolist() if mask is not None else [1] * len(initial_anchors)
-            refined_anchors = [initial_anchors[idx] for idx, val in enumerate(inliers) if val]
-            M, transform_type, _ = solve_latlon_to_pixel(refined_anchors)
-            
-            # Setup for Collision-Free Marking
-            occupied_rects = []
-            # Reserve area for existing OCR finds
-            for r in match_results:
-                if r['Status'] == 'Found' and r['BBox']:
-                    (tl, tr, br, bl) = r['BBox']
-                    occupied_rects.append((int(tl[0]-5), int(tl[1]-5), int(br[0]+5), int(br[1]+5)))
-
-            # Mark missing tenants (Ensures total coverage of the database)
-            for r in match_results:
-                if r['Status'] == 'Missing' and r.get('Latitude') and r.get('Longitude'):
-                    lon, lat = r['Longitude'], r['Latitude']
-                    if transform_type == "homography":
-                        denom = M[2,0]*lon + M[2,1]*lat + M[2,2]
-                        if abs(denom) < 1e-6: continue
-                        px = (M[0,0]*lon + M[0,1]*lat + M[0,2]) / denom
-                        py = (M[1,0]*lon + M[1,1]*lat + M[1,2]) / denom
-                    else:
-                        px = M[0,0]*lon + M[0,1]*lat + M[0,2]
-                        py = M[1,0]*lon + M[1,1]*lat + M[1,2]
-
-                    # If projected coordinates are within view, we MARK IT to avoid missing any list entry
-                    if 10 <= px < w-10 and 10 <= py < h-10:
-                        # Draw Marker: Concentric circles for high visibility
-                        cv2.circle(missing_map_img, (int(px), int(py)), 4, (255, 255, 255), -1, cv2.LINE_AA)
-                        cv2.circle(missing_map_img, (int(px), int(py)), 2, (0, 0, 255), -1, cv2.LINE_AA)
-                        
-                        # Smart Labeling (Collision Detection)
-                        label = r['Tenant'].title()
-                        font = cv2.FONT_HERSHEY_SIMPLEX
-                        font_scale = 0.35
-                        thickness = 1
-                        (lw, lh), _ = cv2.getTextSize(label, font, font_scale, thickness)
-                        
-                        # Try placing label in sorted order of preference
-                        best_pos = None
-                        offsets = [
-                            (12, -8),   # Top Right (adjusted)
-                            (12, 12),   # Bottom Right
-                            (-lw-12, -8), # Top Left
-                            (-lw-12, 12), # Bottom Left
-                            (-lw/2, -18), # Directly Above
-                            (-lw/2, 25),  # Directly Below
-                            (5, -20),    # Steep Angle Above
-                            (5, 20),     # Steep Angle Below
-                            (-lw-5, -20),
-                            (-lw-5, 20)
-                        ]
-                        
-                        for ox, oy in offsets:
-                            lx, ly = int(px) + int(ox), int(py) + int(oy)
-                            # Create a relaxed bounding box for the label with 4px padding
-                            rect = (lx-4, ly-lh-4, lx+lw+4, ly+4)
-                            
-                            if 5 <= rect[0] and rect[2] < w-5 and 5 <= rect[1] and rect[3] < h-5:
-                                collision = False
-                                for o in occupied_rects:
-                                    # Standard AABB collision check
-                                    if not (rect[2] < o[0] or rect[0] > o[2] or rect[3] < o[1] or rect[1] > o[3]):
-                                        collision = True
-                                        break
-                                if not collision:
-                                    best_pos = (lx, ly, rect)
-                                    break
-                        
-                        if best_pos:
-                            lx, ly, rect = best_pos
-                            occupied_rects.append(rect)
-                            # Professional Label Style: White background box with red border
-                            cv2.rectangle(missing_map_img, (rect[0], rect[1]), (rect[2], rect[3]), (255, 255, 255), -1)
-                            cv2.rectangle(missing_map_img, (rect[0], rect[1]), (rect[2], rect[3]), (0, 0, 255), 1)
-                            cv2.putText(missing_map_img, label, (lx, ly), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-
-    return image, detection_img, missing_map_img, match_results, ocr_texts
-
-
 def clean_hours_helper(val):
     if isinstance(val, list):
         summary = []
@@ -365,7 +166,8 @@ def main():
 
     st.title("🏙️ Mall Tenant Analysis & Vision Pipeline")
     
-    reader, sbert_model = load_models()
+    # reader, sbert_model = load_models()
+    reader, sbert_model = None, None
 
     # --- Data Management ---
     if 'tenants' not in st.session_state:
@@ -478,11 +280,10 @@ def main():
         df_tenants['hours'] = df_tenants['hours'].apply(clean_hours_helper)
 
     # --- Main Application Tabs ---
-    tab_db, tab_comp, tab_img, tab_report = st.tabs([
+    tab_db, tab_loc, tab_comp = st.tabs([
         "📊 Tenant Database", 
+        "📍 Location Detail",
         "🔄 Comparison Tool", 
-        "🔍 Image Analysis", 
-        "📈 Comparison Report"
     ])
 
     with tab_db:
@@ -515,6 +316,42 @@ def main():
                 data=csv_db,
                 file_name="mall_tenants_full.csv",
                 mime="text/csv",
+            )
+        
+    with tab_loc:
+        st.subheader("📍 Detailed Location & Coordinate Data")
+        st.markdown("This table provides specific georeferenced coordinates and location IDs for each tenant.")
+        
+        if not df_tenants.empty:
+            # Filter for specific columns requested by the user
+            loc_req_cols = ['name', 'location_id', 'latitude', 'longitude', 'floor']
+            # Ensure columns exist in dataframe
+            available_loc_cols = [c for c in loc_req_cols if c in df_tenants.columns]
+            
+            df_loc = df_tenants[available_loc_cols].copy()
+            
+            # Display the table
+            st.dataframe(
+                df_loc,
+                use_container_width=True,
+                height=500,
+                column_config={
+                    "name": st.column_config.TextColumn("Tenant Name", width="medium"),
+                    "location_id": st.column_config.TextColumn("Location ID", width="small"),
+                    "latitude": st.column_config.NumberColumn("Latitude", format="%.6f"),
+                    "longitude": st.column_config.NumberColumn("Longitude", format="%.6f"),
+                    "floor": st.column_config.TextColumn("Floor", width="small"),
+                }
+            )
+            
+            # Provide specific download button for this table
+            csv_loc_data = df_loc.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Location Coordinate Table (CSV)",
+                data=csv_loc_data,
+                file_name="tenant_location_coordinates.csv",
+                mime="text/csv",
+                key="download_loc_csv"
             )
 
     with tab_comp:
@@ -597,149 +434,13 @@ def main():
                         else:
                             st.write("No new tenants found.")
                             
-                    # with res_col3:
-                    #     st.markdown("### ❌ Missing Tenants")
-                    #     st.markdown("*Gone from the latest scrape*")
-                    #     if missing_list:
-                    #         st.dataframe(pd.DataFrame({"Tenant Name": missing_list}), use_container_width=True, height=450)
-                    #     else:
-                    #         st.write("No missing tenants found.")
                             
             except Exception as e:
                 st.error(f"Failed to process the Excel file. Error: {e}")
         else:
             st.info("💡 Please upload an Excel file (.xlsx or .xls) to start the comparison.")
 
-    with tab_img:
-        st.subheader(" Visual Map Analysis")
-        st.markdown("Browse and select one or more mall map screenshots to identify detected and missing tenants.")
-        
-        # File Uploader - Dynamic Browse
-        uploaded_files = st.file_uploader("Upload Mall Map Screenshots (Multiple Allowed)", 
-                                         type=['png', 'jpg', 'jpeg'], 
-                                         accept_multiple_files=True)
-        
-        if uploaded_files:
-            st.success(f"✅ **{len(uploaded_files)}** images loaded and ready.")
-            
-            # Dynamic Preview Gallery
-            with st.expander(" Preview Uploaded Images", expanded=False):
-                cols = st.columns(4)
-                for i, file in enumerate(uploaded_files):
-                    cols[i % 4].image(file, caption=file.name, use_container_width=True)
-
-            if st.button(" Run Comprehensive Analysis", type="primary"):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                if 'analysis_results' not in st.session_state:
-                    st.session_state['analysis_results'] = {}
-                
-                # PRE-CALCULATE Embeddings once
-                status_text.info(" Pre-calculating tenant embeddings...")
-                json_names = [t['name'] for t in tenants if t['name']]
-                json_embeddings = sbert_model.encode(json_names, convert_to_tensor=True, show_progress_bar=False)
-                
-                for idx, uploaded_file in enumerate(uploaded_files):
-                    img_name = uploaded_file.name
-                    status_text.info(f"⚙️ **Processing ({idx+1}/{len(uploaded_files)}):** `{img_name}`...")
-                    
-                    try:
-                        time.sleep(0.1)
-                        orig_img, det_img, miss_img, matches, detected_text = run_analysis(
-                            uploaded_file, reader, sbert_model, tenants, json_embeddings, threshold=similarity_threshold
-                        )
-                        
-                        if matches:
-                            st.session_state['analysis_results'][img_name] = {
-                                'matches': matches,
-                                'det_img': det_img,
-                                'miss_img': miss_img
-                            }
-                            
-                            # LIVE RESULTS TABLE
-                            with st.expander(f"📊 Results for {img_name}", expanded=True):
-                                df = pd.DataFrame(matches)
-                                found_df = df[df['Status'] == 'Found'][['Tenant', 'Score', 'Floor', 'LocationID']]
-                                st.markdown(f"**Verified Tenants Identified:** `{len(found_df)}`")
-                                st.dataframe(found_df, use_container_width=True)
-                                st.image(det_img, caption="Detection Highlight", use_container_width=True)
-                            
-                            # Backup to disk
-                            report_path = os.path.join(IMAGES_DIR, f"report_{img_name}.csv")
-                            pd.DataFrame(matches).to_csv(report_path, index=False)
-                    except Exception as e:
-                        st.error(f" Error processing `{img_name}`: {e}")
-                    
-                    gc.collect() 
-                    progress_bar.progress((idx + 1) / len(uploaded_files))
-                
-                status_text.success(f"🎊 **Batch Complete!** Switch to 'Comparison Report' to see the audit.")
-        else:
-            st.info("👆 Use the browser above to upload map images from your local machine.")
-
-    with tab_report:
-        st.subheader("Comparison & Coverage Report")
-        
-        if 'analysis_results' not in st.session_state:
-            st.info("Run the analysis in the 'Image Analysis' tab first to generate this report.")
-        else:
-            results = st.session_state['analysis_results']
-            
-            # Create Comparison Matrix
-            # Columns: Tenant, Image 1 (Found/Missing), Image 2...
-            all_tenants_names = [t['name'] for t in tenants]
-            comparison_df = pd.DataFrame({'Tenant': all_tenants_names})
-            
-            for img_name, data in results.items():
-                matches = data['matches']
-                match_dict = {m['Tenant']: m['Status'] for m in matches}
-                comparison_df[img_name] = comparison_df['Tenant'].map(match_dict)
-            
-            # --- Visual Missing Map Gallery ---
-            st.write("#### 📍 Missing Tenant Marking Maps")
-            st.markdown("These maps show red dots for tenants that exist in the database for the detected floor but were **not** found in the screenshot via OCR.")
-            
-            for img_name, data in results.items():
-                with st.expander(f"🗺️ Missing Markings for {img_name}", expanded=True):
-                    st.image(data['miss_img'], use_container_width=True)
-            
-            # Summary Metrics
-            found_at_least_once = comparison_df.iloc[:, 1:].eq('Found').any(axis=1).sum()
-            total_unique = len(all_tenants_names)
-            coverage = (found_at_least_once / total_unique) * 100
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Database Tenants", total_unique)
-            c2.metric("Tenants Found in Maps", found_at_least_once)
-            c3.metric("Map Coverage %", f"{coverage:.1f}%")
-            
-            st.write("#### 📊 Visibility Matrix")
-            st.markdown("This table shows which tenants were detected in each analyzed image.")
-            
-            # Styling the matrix
-            def color_status(val):
-                color = '#d4edda' if val == 'Found' else '#f8d7da' if val == 'Missing' else 'white'
-                return f'background-color: {color}'
-            
-            st.dataframe(
-                comparison_df.style.applymap(color_status, subset=comparison_df.columns[1:]),
-                use_container_width=True,
-                height=500
-            )
-            
-            # Missing overall
-            missing_overall = comparison_df[~comparison_df.iloc[:, 1:].eq('Found').any(axis=1)]
-            if not missing_overall.empty:
-                with st.expander(f"⚠️ Tenants Not Found in Any Image ({len(missing_overall)})"):
-                    st.dataframe(missing_overall[['Tenant']], use_container_width=True, height=300)
-
-            # Export full comparison
-            st.download_button(
-                label="📥 Download Comparison Matrix (CSV)",
-                data=comparison_df.to_csv(index=False).encode('utf-8'),
-                file_name="comparison_matrix.csv",
-                mime="text/csv",
-            )
 
 if __name__ == "__main__":
     main()
+ 

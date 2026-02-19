@@ -2,9 +2,13 @@
 Combined Dashboard - Main UI
 Run: streamlit run main_ui.py --server.port 8501
 Apps start automatically on first load. Click a link to open in a new tab (no collapse, opens immediately).
+
+Deployed (e.g. Railway): set STORE_OPENING_URL, MALL_DASHBOARD_URL, MAP_DASHBOARD_URL so the main UI
+links to the deployed sub-apps instead of starting them locally.
 """
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -16,6 +20,14 @@ import streamlit as st
 # Ports and app paths (ROOT = folder containing main_ui.py)
 ROOT = Path(__file__).resolve().parent
 SHARED_INPUT_FILE = ROOT / "shared_dashboard_input.json"
+
+# When deployed (e.g. Railway), sub-apps run as separate services. Set these env vars to their public URLs.
+DEPLOYED_APP_URLS = {
+    "store_opening": (os.environ.get("STORE_OPENING_URL") or "").strip().rstrip("/"),
+    "mall_dashboard": (os.environ.get("MALL_DASHBOARD_URL") or "").strip().rstrip("/"),
+    "map_dashboard": (os.environ.get("MAP_DASHBOARD_URL") or "").strip().rstrip("/"),
+}
+IS_DEPLOYED = any(DEPLOYED_APP_URLS.values())
 
 # Prefer project .venv Python so all sub-apps use same env
 def _python_executable():
@@ -167,12 +179,15 @@ except Exception:
     pass
 
 # Start apps on first load (once per browser session) so links open immediately.
+# When deployed (STORE_OPENING_URL etc. set), we do not start subprocesses; we link to the deployed URLs.
 # We also remember the *actual* port each app was started on, since we may have
 # to move to a different free port if the preferred one is already in use.
-# Delay between starts so each app has time to bind before we pick the next port.
 if "app_ports" not in st.session_state:
     st.session_state.app_ports = {}
     for i, app in enumerate(APPS):
+        if DEPLOYED_APP_URLS.get(app["key"]):
+            # Sub-app is deployed elsewhere; no local process
+            continue
         if i > 0:
             time.sleep(4)  # Wait for previous app to bind before checking ports
         actual_port = start_app(app["cwd"], app["script"], app["port"])
@@ -374,9 +389,14 @@ st.markdown("---")
 # Vertical list of cards (include one-time token per app so pre-fill only when opened from here; refresh in app won't pre-fill)
 _tokens = st.session_state.get("delivery_tokens", {})
 for app in APPS:
-    actual_port = st.session_state.app_ports.get(app["key"], app["port"])
-    tok = _tokens.get(app["key"], "")
-    url = f"http://localhost:{actual_port}/?from_dashboard={tok}&app={app['key']}" if tok else f"http://localhost:{actual_port}"
+    deployed_url = DEPLOYED_APP_URLS.get(app["key"])
+    if deployed_url:
+        tok = _tokens.get(app["key"], "")
+        url = f"{deployed_url}/?from_dashboard={tok}&app={app['key']}" if tok else deployed_url
+    else:
+        actual_port = st.session_state.app_ports.get(app["key"], app["port"])
+        tok = _tokens.get(app["key"], "")
+        url = f"http://localhost:{actual_port}/?from_dashboard={tok}&app={app['key']}" if tok else f"http://localhost:{actual_port}"
     button_label = f"Open {app['title']}"
     st.markdown(
         f"""
@@ -393,8 +413,10 @@ for app in APPS:
         unsafe_allow_html=True,
     )
 
-st.markdown(
-    '<p class="dashboard-footer">Apps start when you open this page. If a link doesn’t load, wait a few seconds and try again.</p>',
-    unsafe_allow_html=True,
+footer_msg = (
+    "Apps start when you open this page. If a link doesn't load, wait a few seconds and try again."
+    if not IS_DEPLOYED
+    else "Each app runs on its own service. Click a link to open it in a new tab."
 )
+st.markdown(f'<p class="dashboard-footer">{footer_msg}</p>', unsafe_allow_html=True)
 
